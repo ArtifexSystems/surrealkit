@@ -69,6 +69,10 @@ services:
 
 `surrealkit` exits on completion, so Compose moves on, ideal for "apply schema then run tests" pipelines.
 
+## Library
+
+SurrealKit can also be used as a Rust library. See [`crates/surrealkit/README.md`](crates/surrealkit/README.md) for the full library API reference.
+
 ## Usage
 
 Initialise a new project:
