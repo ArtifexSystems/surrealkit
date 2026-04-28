@@ -5,12 +5,12 @@ use surrealdb::Surreal;
 use surrealdb::engine::any::{Any, connect};
 use surrealdb::opt::Config;
 use surrealdb::opt::capabilities::Capabilities;
+use surrealkit::schema_state::EntityKey;
 use surrealkit::{
 	EmbeddedSchemaFile, RolloutExecutionOpts, RolloutPhase, RolloutPlanOpts, RolloutSpec,
 	RolloutStep, RolloutStepKind, SyncOpts, run_baseline, run_complete, run_complete_with_spec,
-	run_plan, run_rollback, run_rollback_with_spec, run_setup, run_start, run_status,
-	run_start_with_spec, run_sync_embedded, run_sync_embedded_with_opts, seed_from_dir,
-	schema_state::EntityKey,
+	run_plan, run_rollback, run_rollback_with_spec, run_setup, run_start, run_start_with_spec,
+	run_status, run_sync_embedded, run_sync_embedded_with_opts, seed_from_dir,
 };
 
 async fn mem_db() -> Surreal<Any> {
@@ -335,7 +335,11 @@ fn add_table_spec(id: &str, table: &str) -> RolloutSpec {
 				files: vec![],
 				sql: None,
 				expect: None,
-				entities: vec![EntityKey { kind: "table".to_string(), scope: None, name: table.to_string() }],
+				entities: vec![EntityKey {
+					kind: "table".to_string(),
+					scope: None,
+					name: table.to_string(),
+				}],
 				idempotent: None,
 			},
 		],
@@ -346,10 +350,15 @@ fn add_table_spec(id: &str, table: &str) -> RolloutSpec {
 async fn rollout_with_spec_full_lifecycle() {
 	let db = mem_db().await;
 
-	static SOURCE: &[EmbeddedSchemaFile] =
-		&[EmbeddedSchemaFile { path: "database/schema/order.surql", sql: "DEFINE TABLE order SCHEMALESS;" }];
+	static SOURCE: &[EmbeddedSchemaFile] = &[EmbeddedSchemaFile {
+		path: "database/schema/order.surql",
+		sql: "DEFINE TABLE order SCHEMALESS;",
+	}];
 	static TARGET: &[EmbeddedSchemaFile] = &[
-		EmbeddedSchemaFile { path: "database/schema/order.surql", sql: "DEFINE TABLE order SCHEMALESS;" },
+		EmbeddedSchemaFile {
+			path: "database/schema/order.surql",
+			sql: "DEFINE TABLE order SCHEMALESS;",
+		},
 		EmbeddedSchemaFile {
 			path: "database/schema/invoice.surql",
 			sql: "DEFINE TABLE invoice SCHEMALESS;",
@@ -372,11 +381,19 @@ async fn rollout_with_spec_full_lifecycle() {
 async fn rollout_with_spec_rollback() {
 	let db = mem_db().await;
 
-	static SOURCE: &[EmbeddedSchemaFile] =
-		&[EmbeddedSchemaFile { path: "database/schema/product.surql", sql: "DEFINE TABLE product SCHEMALESS;" }];
+	static SOURCE: &[EmbeddedSchemaFile] = &[EmbeddedSchemaFile {
+		path: "database/schema/product.surql",
+		sql: "DEFINE TABLE product SCHEMALESS;",
+	}];
 	static TARGET: &[EmbeddedSchemaFile] = &[
-		EmbeddedSchemaFile { path: "database/schema/product.surql", sql: "DEFINE TABLE product SCHEMALESS;" },
-		EmbeddedSchemaFile { path: "database/schema/variant.surql", sql: "DEFINE TABLE variant SCHEMALESS;" },
+		EmbeddedSchemaFile {
+			path: "database/schema/product.surql",
+			sql: "DEFINE TABLE product SCHEMALESS;",
+		},
+		EmbeddedSchemaFile {
+			path: "database/schema/variant.surql",
+			sql: "DEFINE TABLE variant SCHEMALESS;",
+		},
 	];
 
 	run_sync_embedded(&db, SOURCE).await.expect("baseline sync");
@@ -392,15 +409,29 @@ async fn rollout_with_spec_rollback() {
 async fn rollout_with_spec_blocks_concurrent_rollout() {
 	let db = mem_db().await;
 
-	static SOURCE: &[EmbeddedSchemaFile] =
-		&[EmbeddedSchemaFile { path: "database/schema/user.surql", sql: "DEFINE TABLE user SCHEMALESS;" }];
+	static SOURCE: &[EmbeddedSchemaFile] = &[EmbeddedSchemaFile {
+		path: "database/schema/user.surql",
+		sql: "DEFINE TABLE user SCHEMALESS;",
+	}];
 	static TARGET_A: &[EmbeddedSchemaFile] = &[
-		EmbeddedSchemaFile { path: "database/schema/user.surql", sql: "DEFINE TABLE user SCHEMALESS;" },
-		EmbeddedSchemaFile { path: "database/schema/session.surql", sql: "DEFINE TABLE session SCHEMALESS;" },
+		EmbeddedSchemaFile {
+			path: "database/schema/user.surql",
+			sql: "DEFINE TABLE user SCHEMALESS;",
+		},
+		EmbeddedSchemaFile {
+			path: "database/schema/session.surql",
+			sql: "DEFINE TABLE session SCHEMALESS;",
+		},
 	];
 	static TARGET_B: &[EmbeddedSchemaFile] = &[
-		EmbeddedSchemaFile { path: "database/schema/user.surql", sql: "DEFINE TABLE user SCHEMALESS;" },
-		EmbeddedSchemaFile { path: "database/schema/token.surql", sql: "DEFINE TABLE token SCHEMALESS;" },
+		EmbeddedSchemaFile {
+			path: "database/schema/user.surql",
+			sql: "DEFINE TABLE user SCHEMALESS;",
+		},
+		EmbeddedSchemaFile {
+			path: "database/schema/token.surql",
+			sql: "DEFINE TABLE token SCHEMALESS;",
+		},
 	];
 
 	run_sync_embedded(&db, SOURCE).await.expect("baseline sync");

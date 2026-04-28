@@ -295,8 +295,10 @@ pub async fn run_start(db: &Surreal<Any>, opts: RolloutExecutionOpts) -> Result<
 	}
 	let target_catalog = build_catalog_snapshot(&files)?;
 	let source_entities = load_managed_entities(db).await?;
-	let source_catalog =
-		CatalogSnapshot { version: 2, entities: source_entities.into_iter().map(|r| r.entity).collect() };
+	let source_catalog = CatalogSnapshot {
+		version: 2,
+		entities: source_entities.into_iter().map(|r| r.entity).collect(),
+	};
 	start_inner(db, &rollout, &source_catalog, &target_catalog).await
 }
 
@@ -329,8 +331,10 @@ pub async fn run_start_with_spec(
 	}
 	let target_catalog = build_catalog_snapshot(&schema_files)?;
 	let source_entities = load_managed_entities(db).await?;
-	let source_catalog =
-		CatalogSnapshot { version: 2, entities: source_entities.into_iter().map(|r| r.entity).collect() };
+	let source_catalog = CatalogSnapshot {
+		version: 2,
+		entities: source_entities.into_iter().map(|r| r.entity).collect(),
+	};
 	start_inner(db, &make_loaded_spec(spec), &source_catalog, &target_catalog).await
 }
 
@@ -772,9 +776,7 @@ fn changed_files(files: &[SchemaFile], diff: &FileDiff) -> Vec<String> {
 }
 
 fn make_loaded_spec(spec: &RolloutSpec) -> LoadedRolloutSpec {
-	let checksum = sha256_hex(
-		toml::to_string_pretty(spec).unwrap_or_default().as_bytes(),
-	);
+	let checksum = sha256_hex(toml::to_string_pretty(spec).unwrap_or_default().as_bytes());
 	LoadedRolloutSpec {
 		path: PathBuf::from(format!("embedded:{}", spec.id)),
 		checksum,
@@ -782,9 +784,7 @@ fn make_loaded_spec(spec: &RolloutSpec) -> LoadedRolloutSpec {
 	}
 }
 
-fn embedded_to_schema_files(
-	files: &[crate::sync::EmbeddedSchemaFile],
-) -> Vec<SchemaFile> {
+fn embedded_to_schema_files(files: &[crate::sync::EmbeddedSchemaFile]) -> Vec<SchemaFile> {
 	files
 		.iter()
 		.map(|f| SchemaFile {
