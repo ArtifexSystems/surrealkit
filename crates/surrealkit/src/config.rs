@@ -291,8 +291,10 @@ mod tests {
 			("db", AuthLevel::Database),
 			("DB", AuthLevel::Database),
 		] {
-			let overrides =
-				DbOverrides { auth_level: Some(input.into()), ..Default::default() };
+			let overrides = DbOverrides {
+				auth_level: Some(input.into()),
+				..Default::default()
+			};
 			let cfg = DbCfg::from_env(None, &overrides).unwrap();
 			assert_eq!(cfg.auth_level(), &expected, "input={input}");
 		}
@@ -312,8 +314,10 @@ mod tests {
 	fn from_env_rejects_unknown_auth_level() {
 		let _guard = ENV_LOCK.lock().unwrap();
 		clear_db_env();
-		let overrides =
-			DbOverrides { auth_level: Some("superadmin".into()), ..Default::default() };
+		let overrides = DbOverrides {
+			auth_level: Some("superadmin".into()),
+			..Default::default()
+		};
 		let err = DbCfg::from_env(None, &overrides).unwrap_err();
 		assert!(err.to_string().contains("invalid auth level"), "got: {err}");
 	}
@@ -381,9 +385,7 @@ pub async fn connect(cfg: &DbCfg) -> Result<Surreal<Any>> {
 			})
 			.await
 			.context("namespace signin failed")?;
-			db.use_db(&cfg.db)
-				.await
-				.with_context(|| format!("use_db failed for db={}", cfg.db))?;
+			db.use_db(&cfg.db).await.with_context(|| format!("use_db failed for db={}", cfg.db))?;
 		}
 		AuthLevel::Database => {
 			db.signin(Database {
