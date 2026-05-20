@@ -69,6 +69,12 @@ enum Commands {
 		no_prune: bool,
 		#[arg(long)]
 		allow_shared_prune: bool,
+		/// Refuse to prune more than this many stale managed entities per
+		/// sync. `0` disables the cap. Catches "ran from the wrong cwd"
+		/// mistakes where surrealkit thinks every entity is stale because
+		/// it walked the wrong schema dir. Default: 50.
+		#[arg(long, default_value_t = 50)]
+		max_prune: usize,
 	},
 	Rollout {
 		#[command(subcommand)]
@@ -178,6 +184,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 			fail_fast,
 			no_prune,
 			allow_shared_prune,
+			max_prune,
 		} => {
 			let db = connect_from_env(env.as_ref(), &overrides).await?;
 			sync::run_sync(
@@ -189,6 +196,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 					fail_fast,
 					prune: !no_prune,
 					allow_shared_prune,
+					max_prune,
 					vars: template_vars,
 				},
 			)

@@ -140,6 +140,66 @@ async fn sync_embedded_prunes_removed_files() {
 }
 
 #[tokio::test]
+async fn sync_embedded_refuses_to_prune_beyond_max_prune_limit() {
+	// Safety rail: a non-zero max_prune caps how many stale managed entities
+	// a single sync may drop. Triggered by real-world "ran from the wrong
+	// cwd" mistakes that turn an entire project into "stale" in one go.
+	let db = mem_db().await;
+
+	static THREE_FILES: &[EmbeddedSchemaFile] = &[
+		EmbeddedSchemaFile {
+			path: "database/schema/a.surql",
+			sql: "DEFINE TABLE table_a SCHEMALESS;",
+		},
+		EmbeddedSchemaFile {
+			path: "database/schema/b.surql",
+			sql: "DEFINE TABLE table_b SCHEMALESS;",
+		},
+		EmbeddedSchemaFile {
+			path: "database/schema/c.surql",
+			sql: "DEFINE TABLE table_c SCHEMALESS;",
+		},
+	];
+	run_sync_embedded(&db, THREE_FILES).await.expect("initial sync");
+
+	// Empty schema set → all three entities become stale. Cap at 2.
+	static EMPTY: &[EmbeddedSchemaFile] = &[];
+	let err = run_sync_embedded_with_opts(
+		&db,
+		EMPTY,
+		&SyncOpts {
+			fail_fast: true,
+			prune: true,
+			max_prune: 2,
+			..Default::default()
+		},
+	)
+	.await
+	.expect_err("3 > max_prune=2 must abort");
+	let msg = format!("{err:#}");
+	assert!(msg.contains("refusing to prune"), "unexpected error: {msg}");
+	assert!(msg.contains("--max-prune"), "error should reference flag: {msg}");
+
+	// Cap at 5 (above stale count) → succeeds.
+	run_sync_embedded_with_opts(
+		&db,
+		EMPTY,
+		&SyncOpts {
+			fail_fast: true,
+			prune: true,
+			max_prune: 5,
+			..Default::default()
+		},
+	)
+	.await
+	.expect("3 <= max_prune=5 must succeed");
+
+	let mut resp = db.query("SELECT key FROM __entity WHERE ns = 'sync';").await.expect("query");
+	let rows: Vec<serde_json::Value> = resp.take(0).expect("take");
+	assert!(rows.is_empty(), "all three entities must be pruned when limit allows");
+}
+
+#[tokio::test]
 async fn sync_embedded_self_heals_catalog_drift() {
 	// Catalog drift: an entity tracked in __entity is already missing from the
 	// live DB (e.g., a `run_sql REMOVE …` rollout step dropped it but didn't

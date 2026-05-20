@@ -81,6 +81,8 @@ run_sync_embedded_with_opts(
         fail_fast: true,
         prune: true,         // remove DB objects no longer in SCHEMA
         allow_shared_prune: false,
+        max_prune: 50,       // refuse runaway prunes; 0 = unlimited
+        ..Default::default()
     },
 )
 .await?;

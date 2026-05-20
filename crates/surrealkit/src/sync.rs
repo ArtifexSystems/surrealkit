@@ -29,6 +29,12 @@ pub struct SyncOpts {
 	pub fail_fast: bool,
 	pub prune: bool,
 	pub allow_shared_prune: bool,
+	/// Refuse to prune more than this many stale managed entities per sync.
+	/// `0` disables the cap (legacy behavior). Defaults to `0` so embedded
+	/// callers and direct library users stay backwards-compatible; the CLI
+	/// sets it to `50` so a "ran from the wrong cwd" mistake can't wipe a
+	/// whole project's schema in one shot.
+	pub max_prune: usize,
 	/// Template variables substituted into `.surql` content before execution.
 	pub vars: TemplateVars,
 }
@@ -88,6 +94,7 @@ pub async fn run_sync_embedded(db: &Surreal<Any>, files: &[EmbeddedSchemaFile]) 
 			fail_fast: true,
 			prune: true,
 			allow_shared_prune: false,
+			max_prune: 50,
 			vars: TemplateVars::default(),
 		},
 	)
@@ -232,13 +239,31 @@ async fn run_sync_with_files(
 	let mut pruned_count = 0usize;
 	if opts.prune && stale_count > 0 {
 		let remove_sql = render_remove_sql(&stale_entities, true)?;
+		let over_max_prune = opts.max_prune > 0 && stale_count > opts.max_prune;
 		if opts.dry_run {
 			if !watch_mode {
-				println!("DRY RUN: would prune {} stale managed entities", remove_sql.len());
+				if over_max_prune {
+					println!(
+						"DRY RUN: would prune {} stale managed entities (EXCEEDS --max-prune {}; non-dry-run will refuse without override)",
+						remove_sql.len(),
+						opts.max_prune
+					);
+				} else {
+					println!("DRY RUN: would prune {} stale managed entities", remove_sql.len());
+				}
 				for stmt in &remove_sql {
 					println!("  {}", stmt);
 				}
 			}
+		} else if over_max_prune {
+			bail!(
+				"refusing to prune {} stale managed entities; --max-prune limit is {}. \
+				 Run `surrealkit sync --dry-run` to review the list. If the prune is \
+				 intentional, rerun with `--max-prune {}` (or `--max-prune 0` for unlimited).",
+				stale_count,
+				opts.max_prune,
+				stale_count
+			);
 		} else if shared {
 			acquire_lock(db, "global").await?;
 			let result = prune_managed_entities(db, &stale_entities).await;

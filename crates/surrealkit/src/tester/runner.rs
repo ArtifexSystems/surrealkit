@@ -253,6 +253,10 @@ impl RunnerContext {
 					fail_fast: true,
 					prune: true,
 					allow_shared_prune: true,
+					// 0 = unlimited: tester namespaces are ephemeral, and we
+					// expect arbitrarily many stale entities when a suite
+					// reshapes the schema mid-flight.
+					max_prune: 0,
 					vars: self.vars.clone(),
 				},
 			)
