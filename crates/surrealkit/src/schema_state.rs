@@ -453,21 +453,104 @@ pub fn ensure_overwrite(sql: &str) -> String {
 	out.join("\n")
 }
 
-fn strip_comments(sql: &str) -> String {
-	let mut out = String::with_capacity(sql.len());
-	let mut chars = sql.chars().peekable();
+/// True if `chars[i..]` begins the embedded-JS `function` keyword at a word
+/// boundary and is followed (after optional whitespace) by `(` — i.e. the start
+/// of a SurrealDB `function(...) { … }` body that must be copied verbatim rather
+/// than comment-stripped.
+fn is_embedded_js_function_at(chars: &[char], i: usize) -> bool {
+	const KW: [char; 8] = ['f', 'u', 'n', 'c', 't', 'i', 'o', 'n'];
+	if !chars[i..].starts_with(&KW) {
+		return false;
+	}
+	if i > 0 {
+		let prev = chars[i - 1];
+		if prev.is_alphanumeric() || prev == '_' {
+			return false;
+		}
+	}
+	let mut j = i + KW.len();
+	while j < chars.len() && chars[j].is_whitespace() {
+		j += 1;
+	}
+	j < chars.len() && chars[j] == '('
+}
+
+/// Copy an embedded `function(...) { … }` construct from `chars[start..]` to `out`
+/// VERBATIM — no comment stripping — tracking JS string and brace nesting so the
+/// body (whose `//` `#` `/* */`, apostrophes and braces are JavaScript, not
+/// SurrealQL) is never truncated. Returns the index just past the closing `}`.
+fn copy_embedded_js_function(chars: &[char], start: usize, out: &mut String) -> usize {
 	let mut in_single = false;
 	let mut in_double = false;
 	let mut in_backtick = false;
 	let mut prev_escape = false;
+	let mut brace_depth: usize = 0;
+	let mut body_started = false;
+	let mut i = start;
+	while i < chars.len() {
+		let ch = chars[i];
+		match ch {
+			'\'' if !in_double && !in_backtick && !prev_escape => in_single = !in_single,
+			'"' if !in_single && !in_backtick && !prev_escape => in_double = !in_double,
+			'`' if !in_single && !in_double && !prev_escape => in_backtick = !in_backtick,
+			'{' if !in_single && !in_double && !in_backtick => {
+				brace_depth += 1;
+				body_started = true;
+			}
+			'}' if !in_single && !in_double && !in_backtick && brace_depth > 0 => {
+				brace_depth -= 1;
+				out.push(ch);
+				i += 1;
+				if body_started && brace_depth == 0 {
+					return i;
+				}
+				prev_escape = false;
+				continue;
+			}
+			_ => {}
+		}
+		prev_escape = ch == '\\' && !prev_escape;
+		out.push(ch);
+		i += 1;
+	}
+	i
+}
 
-	while let Some(ch) = chars.next() {
+/// Strip SurrealQL comments (`--` / `//` / `#` line, `/* */` block) from a schema
+/// statement string, preserving string literals AND embedded-JS `function(){}`
+/// bodies verbatim. Stripping a JS body truncated it (e.g. an apostrophe in a
+/// `//` JS comment desynced quote parity and swallowed real code, including
+/// closing braces), so `surrealkit sync` / `rollout apply_schema` sent a malformed
+/// function the server rejected as `unexpected eof` — while `surrealkit apply`,
+/// which never strips, applied the same file fine.
+fn strip_comments(sql: &str) -> String {
+	let chars: Vec<char> = sql.chars().collect();
+	let mut out = String::with_capacity(sql.len());
+	let mut in_single = false;
+	let mut in_double = false;
+	let mut in_backtick = false;
+	let mut prev_escape = false;
+	let mut i = 0;
+
+	while i < chars.len() {
+		let ch = chars[i];
 		let in_string = in_single || in_double || in_backtick;
+
+		// Embedded SurrealDB JavaScript: copy the whole `function(...) { … }`
+		// verbatim so its JS body is never treated as SurrealQL and truncated.
+		if !in_string && !prev_escape && is_embedded_js_function_at(&chars, i) {
+			i = copy_embedded_js_function(&chars, i, &mut out);
+			prev_escape = false;
+			continue;
+		}
+
 		if !in_string && !prev_escape {
 			// Line comments: --, //, #
-			if (ch == '-' || ch == '/') && chars.peek() == Some(&ch) {
-				chars.next();
-				for c in chars.by_ref() {
+			if (ch == '-' || ch == '/') && chars.get(i + 1) == Some(&ch) {
+				i += 2;
+				while i < chars.len() {
+					let c = chars[i];
+					i += 1;
 					if c == '\n' {
 						out.push('\n');
 						break;
@@ -477,7 +560,10 @@ fn strip_comments(sql: &str) -> String {
 				continue;
 			}
 			if ch == '#' {
-				for c in chars.by_ref() {
+				i += 1;
+				while i < chars.len() {
+					let c = chars[i];
+					i += 1;
 					if c == '\n' {
 						out.push('\n');
 						break;
@@ -487,10 +573,12 @@ fn strip_comments(sql: &str) -> String {
 				continue;
 			}
 			// Block comment: /* ... */ (non-nesting, preserves newlines so line numbers stay sane)
-			if ch == '/' && chars.peek() == Some(&'*') {
-				chars.next();
+			if ch == '/' && chars.get(i + 1) == Some(&'*') {
+				i += 2;
 				let mut prev = '\0';
-				for c in chars.by_ref() {
+				while i < chars.len() {
+					let c = chars[i];
+					i += 1;
 					if c == '\n' {
 						out.push('\n');
 					}
@@ -513,6 +601,7 @@ fn strip_comments(sql: &str) -> String {
 		}
 		prev_escape = ch == '\\' && !prev_escape;
 		out.push(ch);
+		i += 1;
 	}
 	out
 }
@@ -1319,6 +1408,38 @@ mod tests {
 		let result = ensure_overwrite(sql);
 		assert!(result.contains("DEFINE TABLE OVERWRITE post SCHEMAFULL;"), "got: {result}");
 		assert!(!result.contains("IF NOT EXISTS"), "IF NOT EXISTS should be replaced: {result}");
+	}
+
+	#[test]
+	fn strip_comments_preserves_embedded_js_body() {
+		// A DEFINE FUNCTION whose embedded-JS body uses all four comment triggers
+		// (`//`, `/* */`, `#`, and an apostrophe in a comment). Comment-stripping it
+		// as SurrealQL truncated the body — the server then rejected the malformed
+		// function with `unexpected eof`. The JS body must survive verbatim.
+		let sql = "DEFINE FUNCTION fn::probe($a: string) { RETURN function($a) {\n\t// it's a JS comment with a { and } pair, keep me\n\tconst o = { n: 1 }; /* block */\n\treturn o.n; # also JS\n}; } PERMISSIONS FULL;";
+		let stripped = strip_comments(sql);
+		assert!(stripped.contains("// it's a JS comment with a { and } pair, keep me"), "JS // comment stripped: {stripped}");
+		assert!(stripped.contains("/* block */"), "JS block comment stripped: {stripped}");
+		assert!(stripped.contains("# also JS"), "JS # comment stripped: {stripped}");
+		assert!(stripped.contains("const o = { n: 1 };"), "JS code after comment dropped: {stripped}");
+		assert!(stripped.contains("return o.n;"), "JS code dropped: {stripped}");
+		assert_eq!(
+			stripped.matches('{').count(),
+			stripped.matches('}').count(),
+			"brace imbalance after stripping embedded JS: {stripped}"
+		);
+	}
+
+	#[test]
+	fn strip_comments_still_strips_surrealql_comments_outside_js() {
+		// The JS-body carve-out must not stop SurrealQL comments from being stripped
+		// elsewhere (otherwise ensure_overwrite can't find the DEFINE head).
+		let sql = "-- top comment\nDEFINE FUNCTION fn::x() { /* mid */ RETURN function() { return 1; }; } PERMISSIONS FULL; // tail";
+		let stripped = strip_comments(sql);
+		assert!(!stripped.contains("-- top comment"), "SurrealQL -- comment kept: {stripped}");
+		assert!(!stripped.contains("/* mid */"), "SurrealQL block comment kept: {stripped}");
+		assert!(!stripped.contains("// tail"), "SurrealQL // comment kept: {stripped}");
+		assert!(stripped.contains("return 1;"), "JS body lost: {stripped}");
 	}
 
 	#[test]
