@@ -1,6 +1,6 @@
 use std::collections::BTreeSet;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
@@ -15,8 +15,8 @@ use time::macros::format_description;
 use crate::core::{exec_surql, sha256_hex};
 use crate::schema_state::{
 	CATALOG_SNAPSHOT_PATH, CatalogDiff, CatalogEntity, CatalogSnapshot, EntityKey, FileDiff,
-	ROLLOUTS_DIR, SchemaFile, build_catalog_snapshot, collect_schema_files, diff_catalog,
-	diff_schema, ensure_local_state_dirs, ensure_overwrite, hash_schema_snapshot,
+	ROLLOUTS_DIR, SchemaFile, SchemaSnapshot, build_catalog_snapshot, collect_schema_files,
+	diff_catalog, diff_schema, ensure_local_state_dirs, ensure_overwrite, hash_schema_snapshot,
 	load_catalog_snapshot, load_schema_snapshot, render_remove_sql, save_catalog_snapshot,
 	save_schema_snapshot, snapshot_from_files,
 };
@@ -32,6 +32,98 @@ pub struct RolloutPlanOpts {
 #[derive(Debug, Clone)]
 pub struct RolloutExecutionOpts {
 	pub selector: Option<String>,
+}
+
+const PROJECT_CONFIG_PATHS: [&str; 2] = ["database/surrealkit.toml", "surrealkit.toml"];
+
+#[derive(Debug, Default, Deserialize)]
+struct RolloutProjectConfig {
+	#[serde(default)]
+	rollouts: RolloutConfig,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct RolloutConfig {
+	/// Project-root-relative schema-directory prefixes omitted only from rollout
+	/// source/target hash computation. The complete schema tree is still parsed,
+	/// applied, and retained in the desired catalog.
+	#[serde(default)]
+	target_hash_exclude_prefixes: Vec<String>,
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct RolloutHashScope {
+	exclude_prefixes: Vec<String>,
+}
+
+impl RolloutHashScope {
+	fn hash_files(&self, files: &[SchemaFile]) -> Result<String> {
+		self.hash_snapshot(&snapshot_from_files(files))
+	}
+
+	fn hash_snapshot(&self, snapshot: &SchemaSnapshot) -> Result<String> {
+		let mut filtered = snapshot.clone();
+		filtered.files.retain(|entry| {
+			!self.exclude_prefixes.iter().any(|prefix| entry.path.starts_with(prefix))
+		});
+		hash_schema_snapshot(&filtered)
+	}
+}
+
+fn load_rollout_hash_scope() -> Result<RolloutHashScope> {
+	let paths: Vec<&Path> =
+		PROJECT_CONFIG_PATHS.iter().map(Path::new).filter(|path| path.is_file()).collect();
+	match paths.as_slice() {
+		[] => Ok(RolloutHashScope::default()),
+		[path] => {
+			let raw =
+				fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+			parse_rollout_hash_scope(&raw, path)
+		}
+		_ => bail!(
+			"multiple SurrealKit project manifests found ({}); keep one canonical manifest",
+			paths.iter().map(|path| path.display().to_string()).collect::<Vec<_>>().join(", ")
+		),
+	}
+}
+
+fn parse_rollout_hash_scope(raw: &str, path: &Path) -> Result<RolloutHashScope> {
+	let config: RolloutProjectConfig =
+		toml::from_str(raw).with_context(|| format!("parsing {}", path.display()))?;
+	let schema_prefix = format!("{}/", crate::schema_state::SCHEMA_DIR);
+	let mut prefixes = Vec::new();
+	for prefix in config.rollouts.target_hash_exclude_prefixes {
+		if prefix.trim() != prefix
+			|| prefix.contains('\\')
+			|| !prefix.ends_with('/')
+			|| prefix[..prefix.len().saturating_sub(1)].split('/').any(str::is_empty)
+		{
+			bail!(
+				"invalid rollouts.target_hash_exclude_prefixes entry '{}' in {}: use a normalized project-relative directory prefix ending in '/'",
+				prefix,
+				path.display()
+			);
+		}
+		let candidate = Path::new(&prefix);
+		if candidate.is_absolute()
+			|| candidate.components().any(|component| !matches!(component, Component::Normal(_)))
+			|| !prefix.starts_with(&schema_prefix)
+			|| prefix == schema_prefix
+		{
+			bail!(
+				"invalid rollouts.target_hash_exclude_prefixes entry '{}' in {}: prefix must name a directory strictly below {}/",
+				prefix,
+				path.display(),
+				crate::schema_state::SCHEMA_DIR
+			);
+		}
+		prefixes.push(prefix);
+	}
+	prefixes.sort();
+	prefixes.dedup();
+	Ok(RolloutHashScope {
+		exclude_prefixes: prefixes,
+	})
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -155,6 +247,7 @@ pub async fn run_baseline(db: &Surreal<Any>) -> Result<()> {
 
 pub async fn run_plan(opts: RolloutPlanOpts) -> Result<()> {
 	ensure_local_state_dirs()?;
+	let hash_scope = load_rollout_hash_scope()?;
 	let files = collect_schema_files()?;
 	let old_schema = load_schema_snapshot()?;
 	let old_catalog = load_catalog_snapshot()?;
@@ -180,6 +273,7 @@ pub async fn run_plan(opts: RolloutPlanOpts) -> Result<()> {
 		&catalog_diff,
 		&old_schema,
 		&new_schema,
+		&hash_scope,
 	)?;
 	let raw = toml::to_string_pretty(&spec).context("serializing rollout spec")?;
 
@@ -215,7 +309,7 @@ pub async fn run_lint(opts: RolloutExecutionOpts) -> Result<()> {
 	let rollout = load_rollout_spec(resolve_rollout_path(opts.selector.as_deref())?)?;
 	validate_rollout_spec(&rollout.spec)?;
 	let files = collect_schema_files()?;
-	let current_hash = hash_schema_snapshot(&snapshot_from_files(&files))?;
+	let current_hash = load_rollout_hash_scope()?.hash_files(&files)?;
 	if current_hash != rollout.spec.target_schema_hash {
 		bail!(
 			"target schema hash mismatch for '{}': manifest={}, current={}",
@@ -291,7 +385,7 @@ pub async fn run_start(
 	let rollout = load_rollout_spec(resolve_rollout_path(opts.selector.as_deref())?)?;
 	validate_rollout_spec(&rollout.spec)?;
 	let files = collect_schema_files()?;
-	let target_hash = hash_schema_snapshot(&snapshot_from_files(&files))?;
+	let target_hash = load_rollout_hash_scope()?.hash_files(&files)?;
 	if target_hash != rollout.spec.target_schema_hash {
 		bail!(
 			"target schema hash mismatch for '{}': manifest={}, current={}",
@@ -717,6 +811,7 @@ fn build_rollout_spec(
 	catalog_diff: &CatalogDiff,
 	old_schema: &crate::schema_state::SchemaSnapshot,
 	new_schema: &crate::schema_state::SchemaSnapshot,
+	hash_scope: &RolloutHashScope,
 ) -> Result<RolloutSpec> {
 	let changed_paths = changed_files(files, file_diff);
 	let mut steps = Vec::new();
@@ -766,8 +861,8 @@ fn build_rollout_spec(
 	Ok(RolloutSpec {
 		id: rollout_id.to_string(),
 		name: name.to_string(),
-		source_schema_hash: hash_schema_snapshot(old_schema)?,
-		target_schema_hash: hash_schema_snapshot(new_schema)?,
+		source_schema_hash: hash_scope.hash_snapshot(old_schema)?,
+		target_schema_hash: hash_scope.hash_snapshot(new_schema)?,
 		compatibility: "phased".to_string(),
 		renames: Vec::new(),
 		steps,
@@ -1357,6 +1452,7 @@ mod tests {
 					hash: "new".to_string(),
 				}],
 			},
+			&RolloutHashScope::default(),
 		)
 		.expect("build rollout");
 
@@ -1371,6 +1467,71 @@ mod tests {
 		assert!(spec.steps.iter().any(|step| {
 			step.phase == RolloutPhase::Complete && step.kind == RolloutStepKind::RemoveEntities
 		}));
+	}
+
+	#[test]
+	fn rollout_hash_scope_excludes_only_configured_schema_prefixes() {
+		let scope = parse_rollout_hash_scope(
+			r#"
+[rollouts]
+target_hash_exclude_prefixes = ["database/schema/900_extension/"]
+"#,
+			Path::new("database/surrealkit.toml"),
+		)
+		.expect("valid rollout hash scope");
+		let core = SchemaFile {
+			path: "database/schema/020_tables/core.surql".to_string(),
+			sql: "DEFINE TABLE core SCHEMAFULL;".to_string(),
+			hash: "core".to_string(),
+		};
+		let extension = SchemaFile {
+			path: "database/schema/900_extension/tenant.surql".to_string(),
+			sql: "DEFINE TABLE tenant_extension SCHEMAFULL;".to_string(),
+			hash: "tenant".to_string(),
+		};
+
+		assert_eq!(
+			scope.hash_files(&[core.clone(), extension.clone()]).unwrap(),
+			RolloutHashScope::default().hash_files(std::slice::from_ref(&core)).unwrap()
+		);
+		let catalog = build_catalog_snapshot(&[core, extension]).expect("full desired catalog");
+		assert_eq!(catalog.entities.len(), 2, "hash exclusion must not filter the catalog");
+	}
+
+	#[test]
+	fn rollout_hash_scope_deduplicates_prefixes() {
+		let scope = parse_rollout_hash_scope(
+			r#"
+[rollouts]
+target_hash_exclude_prefixes = [
+  "database/schema/900_extension/",
+  "database/schema/900_extension/",
+]
+"#,
+			Path::new("surrealkit.toml"),
+		)
+		.expect("valid rollout hash scope");
+		assert_eq!(scope.exclude_prefixes, vec!["database/schema/900_extension/"]);
+	}
+
+	#[test]
+	fn rollout_hash_scope_rejects_unsafe_prefixes() {
+		for prefix in [
+			"database/schema/",
+			"database/schema/../seed/",
+			"database/schema//900_extension/",
+			"database/schema/900_extension",
+			"/database/schema/900_extension/",
+			"database\\schema\\900_extension\\",
+		] {
+			let raw = format!("[rollouts]\ntarget_hash_exclude_prefixes = ['{prefix}']\n");
+			let err = parse_rollout_hash_scope(&raw, Path::new("surrealkit.toml"))
+				.expect_err("unsafe prefix must fail closed");
+			assert!(
+				err.to_string().contains("target_hash_exclude_prefixes"),
+				"unexpected error for {prefix}: {err:#}"
+			);
+		}
 	}
 
 	#[test]
