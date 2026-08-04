@@ -661,14 +661,14 @@ async fn rollback_inner(
 pub async fn load_active_rollout_id(db: &Surreal<Any>) -> Result<Option<String>> {
 	let mut resp = db
 		.query(
-			"SELECT id, status, started_at FROM __rollout \
+			"SELECT record::id(id) AS rollout_id, started_at FROM __rollout \
 			 WHERE status INSIDE ['planned', 'running_start', 'ready_to_complete', 'running_complete', 'running_rollback', 'failed'] \
 			 ORDER BY started_at DESC LIMIT 1;",
 		)
 		.await?;
 	let raw: Option<surrealdb_types::Value> = resp.take(0)?;
 	let row = raw.map(|v| Value::from_value(v).unwrap_or(Value::Null));
-	Ok(row.and_then(|value| string_field(&value, "id")))
+	Ok(row.and_then(|value| string_field(&value, "rollout_id")))
 }
 
 pub async fn load_managed_entities(db: &Surreal<Any>) -> Result<Vec<ManagedEntityRecord>> {
@@ -1750,11 +1750,12 @@ target_hash_exclude_prefixes = [
 		);
 	}
 
-	// Regression: load_active_rollout_id selected started_at (a datetime field) into
-	// Option<serde_json::Value>, which can panic over HTTP/CBOR. Same root cause as
-	// run_status; verify the fixed deserialization path returns the correct id.
+	// Regression: selecting `id` returns the full SurrealDB record id
+	// (`__rollout:<id>`), so a retry of the same failed rollout was mistaken for a
+	// conflicting rollout. Select the raw record key and verify both same-rollout
+	// resumption and different-rollout exclusion.
 	#[tokio::test]
-	async fn load_active_rollout_id_does_not_panic_with_datetime_field() {
+	async fn active_rollout_id_allows_same_rollout_resume() {
 		let db = connect_mem_db().await;
 		let loaded = sample_loaded_spec("20260420101627__active_id_test");
 
@@ -1764,8 +1765,13 @@ target_hash_exclude_prefixes = [
 
 		let active =
 			load_active_rollout_id(&db).await.expect("load_active_rollout_id must not fail");
-		// The id field is a SurrealDB Thing serialised as a string; the full record ID
-		// (table prefix included) is what the function returns.
-		assert!(active.is_some(), "should find the active rollout");
+		assert_eq!(active.as_deref(), Some(loaded.spec.id.as_str()));
+		ensure_no_conflicting_active_rollout(&db, &loaded.spec.id)
+			.await
+			.expect("the same active rollout must be resumable");
+		let err = ensure_no_conflicting_active_rollout(&db, "different_rollout")
+			.await
+			.expect_err("a different rollout must remain blocked");
+		assert!(err.to_string().contains(&loaded.spec.id));
 	}
 }
