@@ -254,7 +254,15 @@ pub async fn run_plan(opts: RolloutPlanOpts) -> Result<()> {
 	let new_schema = snapshot_from_files(&files);
 	let new_catalog = build_catalog_snapshot(&files)?;
 	let file_diff = diff_schema(&old_schema, &new_schema);
-	let catalog_diff = diff_catalog(&old_catalog, &new_catalog);
+	let catalog_diff =
+		filter_normalization_false_positives(diff_catalog(&old_catalog, &new_catalog));
+
+	// Stale local snapshots (often left behind when schema was applied via sync
+	// outside plan) show hundreds of unrelated "modified" entities and used to
+	// block additive-only plans with a false non-additive refusal. Catch up the
+	// baseline for that drift and plan only truly added files/entities.
+	let (file_diff, catalog_diff, stale_caught_up) =
+		reconcile_stale_baseline_for_autoplan(file_diff, catalog_diff);
 
 	validate_autoplan(&catalog_diff)?;
 
@@ -276,6 +284,17 @@ pub async fn run_plan(opts: RolloutPlanOpts) -> Result<()> {
 		&hash_scope,
 	)?;
 	let raw = toml::to_string_pretty(&spec).context("serializing rollout spec")?;
+
+	if stale_caught_up {
+		eprintln!(
+			"note: database/snapshots were stale relative to database/schema; \
+caught up the rollout baseline and planning additive entities only \
+(+{} file(s), +{} object(s)). Real TYPE/ASSERT edits on a fresh baseline \
+still refuse automatic planning.",
+			file_diff.added.len(),
+			catalog_diff.added.len()
+		);
+	}
 
 	if opts.dry_run {
 		println!("Pending rollout plan:");
@@ -869,6 +888,58 @@ fn build_rollout_spec(
 	})
 }
 
+/// Drop catalog "modifications" whose defining file bytes did not change.
+///
+/// `statement_hash` can drift from normalization alone while `file_hash` stays
+/// equal — that is not a real schema edit and must not trip autoplan.
+fn filter_normalization_false_positives(diff: CatalogDiff) -> CatalogDiff {
+	CatalogDiff {
+		added: diff.added,
+		removed: diff.removed,
+		modified: diff
+			.modified
+			.into_iter()
+			.filter(|change| change.old.file_hash != change.new.file_hash)
+			.collect(),
+	}
+}
+
+/// Wholesale snapshot drift vs `database/schema` (Tamera / T001127 shape).
+///
+/// Small intentional edits stay on the precise refusal path; large modified
+/// counts alongside many changed files mean the local snapshots lagged, not
+/// that the caller's additive files are non-additive.
+fn looks_like_stale_baseline(file_diff: &FileDiff, catalog_diff: &CatalogDiff) -> bool {
+	const MIN_MODIFIED_ENTITIES: usize = 10;
+	const MIN_MODIFIED_FILES: usize = 5;
+	catalog_diff.modified.len() >= MIN_MODIFIED_ENTITIES
+		&& file_diff.modified.len() >= MIN_MODIFIED_FILES
+}
+
+/// When snapshots are stale, plan only additive work and let snapshot save
+/// catch up; keep real in-file modifications refused on a fresh baseline.
+fn reconcile_stale_baseline_for_autoplan(
+	file_diff: FileDiff,
+	catalog_diff: CatalogDiff,
+) -> (FileDiff, CatalogDiff, bool) {
+	if !looks_like_stale_baseline(&file_diff, &catalog_diff) {
+		return (file_diff, catalog_diff, false);
+	}
+	(
+		FileDiff {
+			added: file_diff.added,
+			modified: Vec::new(),
+			removed: Vec::new(),
+		},
+		CatalogDiff {
+			added: catalog_diff.added,
+			modified: Vec::new(),
+			removed: Vec::new(),
+		},
+		true,
+	)
+}
+
 fn validate_autoplan(diff: &CatalogDiff) -> Result<()> {
 	if !diff.modified.is_empty() {
 		let names = diff
@@ -1400,6 +1471,122 @@ mod tests {
 		};
 
 		let err = validate_autoplan(&diff).expect_err("should reject modified entities");
+		assert!(err.to_string().contains("refuses modified"));
+	}
+
+	#[test]
+	fn normalization_false_positive_same_file_hash_is_dropped() {
+		let diff = filter_normalization_false_positives(CatalogDiff {
+			added: Vec::new(),
+			removed: Vec::new(),
+			modified: vec![CatalogChange {
+				old: CatalogEntity {
+					kind: "field".to_string(),
+					scope: Some("person".to_string()),
+					name: "name".to_string(),
+					source_path: "database/schema/person.surql".to_string(),
+					statement_hash: "a".to_string(),
+					file_hash: "same".to_string(),
+				},
+				new: CatalogEntity {
+					kind: "field".to_string(),
+					scope: Some("person".to_string()),
+					name: "name".to_string(),
+					source_path: "database/schema/person.surql".to_string(),
+					statement_hash: "b".to_string(),
+					file_hash: "same".to_string(),
+				},
+			}],
+		});
+		assert!(diff.modified.is_empty());
+		validate_autoplan(&diff).expect("normalization-only drift must not refuse");
+	}
+
+	#[test]
+	fn stale_baseline_reconcile_keeps_additive_and_clears_false_modified() {
+		let mut modified_entities = Vec::new();
+		for i in 0..12 {
+			modified_entities.push(CatalogChange {
+				old: CatalogEntity {
+					kind: "field".to_string(),
+					scope: Some("person".to_string()),
+					name: format!("f{i}"),
+					source_path: format!("database/schema/old_{i}.surql"),
+					statement_hash: "a".to_string(),
+					file_hash: format!("old-{i}"),
+				},
+				new: CatalogEntity {
+					kind: "field".to_string(),
+					scope: Some("person".to_string()),
+					name: format!("f{i}"),
+					source_path: format!("database/schema/old_{i}.surql"),
+					statement_hash: "b".to_string(),
+					file_hash: format!("new-{i}"),
+				},
+			});
+		}
+		let file_diff = FileDiff {
+			added: vec!["database/schema/new_additive.surql".to_string()],
+			modified: (0..6).map(|i| format!("database/schema/old_{i}.surql")).collect(),
+			removed: Vec::new(),
+		};
+		let catalog_diff = CatalogDiff {
+			added: vec![CatalogEntity {
+				kind: "table".to_string(),
+				scope: None,
+				name: "new_additive".to_string(),
+				source_path: "database/schema/new_additive.surql".to_string(),
+				statement_hash: "n".to_string(),
+				file_hash: "n".to_string(),
+			}],
+			removed: Vec::new(),
+			modified: modified_entities,
+		};
+		let (files, entities, stale) =
+			reconcile_stale_baseline_for_autoplan(file_diff, catalog_diff);
+		assert!(stale);
+		assert_eq!(files.added.len(), 1);
+		assert!(files.modified.is_empty());
+		assert_eq!(entities.added.len(), 1);
+		assert!(entities.modified.is_empty());
+		validate_autoplan(&entities).expect("stale+additive must plan clean");
+	}
+
+	#[test]
+	fn small_real_modification_is_not_treated_as_stale() {
+		let file_diff = FileDiff {
+			added: Vec::new(),
+			modified: vec!["database/schema/person.surql".to_string()],
+			removed: Vec::new(),
+		};
+		let catalog_diff = CatalogDiff {
+			added: Vec::new(),
+			removed: Vec::new(),
+			modified: vec![CatalogChange {
+				old: CatalogEntity {
+					kind: "field".to_string(),
+					scope: Some("person".to_string()),
+					name: "name".to_string(),
+					source_path: "database/schema/person.surql".to_string(),
+					statement_hash: "a".to_string(),
+					file_hash: "fa".to_string(),
+				},
+				new: CatalogEntity {
+					kind: "field".to_string(),
+					scope: Some("person".to_string()),
+					name: "name".to_string(),
+					source_path: "database/schema/person.surql".to_string(),
+					statement_hash: "b".to_string(),
+					file_hash: "fb".to_string(),
+				},
+			}],
+		};
+		let (files, entities, stale) =
+			reconcile_stale_baseline_for_autoplan(file_diff, catalog_diff);
+		assert!(!stale);
+		assert_eq!(files.modified.len(), 1);
+		assert_eq!(entities.modified.len(), 1);
+		let err = validate_autoplan(&entities).expect_err("real edits still refuse");
 		assert!(err.to_string().contains("refuses modified"));
 	}
 

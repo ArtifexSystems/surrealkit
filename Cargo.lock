@@ -4128,7 +4128,7 @@ dependencies = [
 
 [[package]]
 name = "surrealkit"
-version = "0.6.3+aieus.8"
+version = "0.6.3+aieus.9"
 dependencies = [
  "anyhow",
  "clap",
