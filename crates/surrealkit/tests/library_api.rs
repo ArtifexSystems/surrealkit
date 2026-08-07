@@ -874,3 +874,188 @@ async fn rollout_run_sql_step_with_vars() {
 		"template variable should have been substituted in run_sql step"
 	);
 }
+
+#[tokio::test]
+async fn concurrent_managed_entity_upserts_do_not_trip_unique_index() {
+	use surrealkit::schema_state::CatalogEntity;
+	use surrealkit::{acquire_lock, release_lock, upsert_managed_entities};
+
+	let db = mem_db().await;
+	run_setup(&db).await.expect("setup");
+
+	let entity = CatalogEntity {
+		kind: "table".into(),
+		scope: None,
+		name: "race_product".into(),
+		source_path: "database/schema/race_product.surql".into(),
+		statement_hash: "hash-a".into(),
+		file_hash: "file-a".into(),
+	};
+	let entities = vec![entity];
+
+	let db_a = db.clone();
+	let db_b = db.clone();
+	let entities_a = entities.clone();
+	let entities_b = entities.clone();
+
+	let (left, right) = tokio::join!(
+		async move {
+			for i in 0..40 {
+				let mut batch = entities_a.clone();
+				batch[0].statement_hash = format!("hash-a-{i}");
+				upsert_managed_entities(&db_a, &batch, None, "active").await?;
+			}
+			anyhow::Ok(())
+		},
+		async move {
+			for i in 0..40 {
+				let mut batch = entities_b.clone();
+				batch[0].statement_hash = format!("hash-b-{i}");
+				upsert_managed_entities(&db_b, &batch, None, "active").await?;
+			}
+			anyhow::Ok(())
+		}
+	);
+
+	left.expect("left upsert stream");
+	right.expect("right upsert stream");
+
+	let mut resp = db
+		.query(
+			"SELECT key, count() AS n FROM __entity WHERE ns = 'schema' \
+			 GROUP BY key;",
+		)
+		.await
+		.expect("count query");
+	let rows: Vec<serde_json::Value> = resp.take(0).expect("take");
+	assert_eq!(rows.len(), 1, "exactly one schema entity key: {rows:?}");
+	assert_eq!(rows[0].get("n").and_then(|v| v.as_i64()), Some(1));
+
+	acquire_lock(&db, "global").await.expect("first lock");
+	let steal = db
+		.query(
+			"CREATE ONLY type::record('__entity', 'lock_global') CONTENT { \
+			 	ns: 'lock', \
+			 	key: 'global', \
+			 	val: { owner: 'thief' }, \
+			 	updated_at: time::now() \
+			 };",
+		)
+		.await;
+	let steal_err = match steal {
+		Ok(resp) => resp.check().expect_err("CREATE must fail while lock held").to_string(),
+		Err(err) => err.to_string(),
+	};
+	assert!(
+		steal_err.contains("already contains")
+			|| steal_err.contains("already exists")
+			|| steal_err.contains("Resource busy")
+			|| steal_err.contains("Transaction conflict"),
+		"expected unique-index / busy rejection, got: {steal_err}"
+	);
+	release_lock(&db, "global").await.expect("release");
+
+	// Stale lock (older than LOCK_STALE) is reclaimed.
+	db.query(
+		"CREATE type::record('__entity', 'lock_stale') CONTENT { \
+		 	ns: 'lock', \
+		 	key: 'stale', \
+		 	val: { owner: 'crashed' }, \
+		 	updated_at: time::now() - 10m \
+		 };",
+	)
+	.await
+	.expect("insert stale")
+	.check()
+	.expect("check stale");
+	acquire_lock(&db, "stale").await.expect("reclaim stale lock");
+	release_lock(&db, "stale").await.expect("release stale");
+}
+
+#[tokio::test]
+async fn concurrent_sync_embedded_serializes_without_unique_index_death() {
+	let db = mem_db().await;
+	run_setup(&db).await.expect("setup once before concurrent syncs");
+
+	static BASELINE: &[EmbeddedSchemaFile] = &[EmbeddedSchemaFile {
+		path: "database/schema/user.surql",
+		sql: "DEFINE TABLE user SCHEMALESS;",
+	}];
+	static TARGET: &[EmbeddedSchemaFile] = &[
+		EmbeddedSchemaFile {
+			path: "database/schema/user.surql",
+			sql: "DEFINE TABLE user SCHEMALESS;",
+		},
+		EmbeddedSchemaFile {
+			path: "database/schema/session.surql",
+			sql: "DEFINE TABLE session SCHEMALESS;",
+		},
+		EmbeddedSchemaFile {
+			path: "database/schema/token.surql",
+			sql: "DEFINE TABLE token SCHEMALESS;",
+		},
+	];
+
+	run_sync_embedded(&db, BASELINE).await.expect("baseline");
+
+	async fn sync_with_bounded_retry(
+		db: Surreal<Any>,
+		files: &'static [EmbeddedSchemaFile],
+	) -> anyhow::Result<()> {
+		// Mirror AIEUS apply wrappers: lock serializes the common path; residual
+		// mem-engine transaction conflicts still retry to completion.
+		const DELAYS_MS: [u64; 5] = [20, 50, 100, 200, 400];
+		for (i, delay) in DELAYS_MS.iter().enumerate() {
+			match run_sync_embedded(&db, files).await {
+				Ok(()) => return Ok(()),
+				Err(err) => {
+					let msg = err.to_string();
+					let retryable = msg.contains("Transaction conflict")
+						|| msg.contains("Resource busy")
+						|| msg.contains("by_ns_key already contains")
+						|| msg.contains("could not acquire SurrealKit lock");
+					if !retryable || i + 1 == DELAYS_MS.len() {
+						return Err(err);
+					}
+					tokio::time::sleep(std::time::Duration::from_millis(*delay)).await;
+				}
+			}
+		}
+		unreachable!()
+	}
+
+	let db_a = db.clone();
+	let db_b = db.clone();
+	let (left, right) = tokio::join!(
+		sync_with_bounded_retry(db_a, TARGET),
+		sync_with_bounded_retry(db_b, TARGET)
+	);
+	left.expect("sync A");
+	right.expect("sync B");
+
+	let mut resp = db
+		.query("SELECT key FROM __entity WHERE ns = 'schema';")
+		.await
+		.expect("key query");
+	let rows: Vec<serde_json::Value> = resp.take(0).expect("take");
+	let mut seen = std::collections::BTreeSet::new();
+	for row in &rows {
+		let key = row.get("key").and_then(|v| v.as_str()).unwrap_or("").to_string();
+		assert!(seen.insert(key.clone()), "duplicate schema key: {key}");
+	}
+
+	let key_set = seen;
+	assert!(
+		key_set.iter().any(|k| k.contains("user")),
+		"user missing from {key_set:?}"
+	);
+	assert!(
+		key_set.iter().any(|k| k.contains("session")),
+		"session missing from {key_set:?}"
+	);
+	assert!(
+		key_set.iter().any(|k| k.contains("token")),
+		"token missing from {key_set:?}"
+	);
+	assert_eq!(key_set.len(), 3, "no spurious prune; keys={key_set:?}");
+}

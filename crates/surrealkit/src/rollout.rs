@@ -746,20 +746,21 @@ pub async fn upsert_managed_entities(
 ) -> Result<()> {
 	for entity in entities {
 		let entity_key = entity_key_string(&entity.kind, entity.scope.as_deref(), &entity.name);
+		// UPSERT … WHERE is one statement against the unique (ns,key) index — no
+		// DELETE+CREATE gap for a concurrent writer to observe a stale unique hit.
 		db.query(
-			"DELETE __entity WHERE ns = 'schema' AND key = $key; \
-			 CREATE __entity CONTENT { \
-			 	ns: 'schema', \
-			 	key: $key, \
-			 	val: { \
+			"UPSERT __entity SET \
+			 	ns = 'schema', \
+			 	key = $key, \
+			 	val = { \
 			 		source_path: $source_path, \
 			 		statement_hash: $statement_hash, \
 			 		file_hash: $file_hash, \
 			 		active_rollout_id: $active_rollout_id, \
 			 		state: $state \
 			 	}, \
-			 	updated_at: time::now() \
-			 };",
+			 	updated_at = time::now() \
+			 WHERE ns = 'schema' AND key = $key;",
 		)
 		.bind(("key", entity_key))
 		.bind(("source_path", entity.source_path.clone()))
@@ -1385,27 +1386,121 @@ fn step_checksum(step: &RolloutStep) -> Result<String> {
 	Ok(sha256_hex(&raw))
 }
 
+/// Stale lock TTL: a crashed holder older than this can be reclaimed.
+pub const LOCK_STALE: std::time::Duration = std::time::Duration::from_secs(300);
+/// Bounded wait when another live apply holds the lock.
+pub const LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+const LOCK_POLL: std::time::Duration = std::time::Duration::from_millis(100);
+
+static LOCK_OWNER_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+fn lock_record_key(lock_key: &str) -> String {
+	let mut out = String::from("lock_");
+	for ch in lock_key.chars() {
+		if ch.is_ascii_alphanumeric() {
+			out.push(ch.to_ascii_lowercase());
+		} else {
+			out.push('_');
+		}
+	}
+	out
+}
+
+fn lock_owner_id() -> String {
+	let base = std::env::var("SURREALKIT_OWNER").unwrap_or_else(|_| "surrealkit".to_string());
+	let seq = LOCK_OWNER_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+	format!("{base}:{}:{seq}", std::process::id())
+}
+
+/// Compare-and-set schema-apply lock. A live holder blocks (bounded wait +
+/// retry); a stale holder (`updated_at` older than [`LOCK_STALE`]) is reclaimed.
+/// Uses a deterministic `__entity` record id so two contenders cannot both
+/// observe a successful create against the same lock key.
 pub async fn acquire_lock(db: &Surreal<Any>, lock_key: &str) -> Result<()> {
-	let owner = std::env::var("SURREALKIT_OWNER").unwrap_or_else(|_| "surrealkit".to_string());
-	db.query(
-		"DELETE __entity WHERE ns = 'lock' AND key = $key; \
-		 CREATE __entity CONTENT { \
-		 	ns: 'lock', \
-		 	key: $key, \
-		 	val: { owner: $owner }, \
-		 	updated_at: time::now() \
-		 };",
-	)
-	.bind(("key", lock_key.to_string()))
-	.bind(("owner", owner))
-	.await?
-	.check()?;
-	Ok(())
+	let owner = lock_owner_id();
+	let record_key = lock_record_key(lock_key);
+	let deadline = tokio::time::Instant::now() + LOCK_WAIT;
+	loop {
+		// Drop only expired holders so a live lock cannot be stolen.
+		db.query(&format!(
+			"DELETE type::record('__entity', $id) WHERE updated_at < time::now() - {}s;",
+			LOCK_STALE.as_secs()
+		))
+		.bind(("id", record_key.clone()))
+		.await?
+		.check()?;
+
+		let create = db
+			.query(
+				"CREATE ONLY type::record('__entity', $id) CONTENT { \
+				 	ns: 'lock', \
+				 	key: $key, \
+				 	val: { owner: $owner }, \
+				 	updated_at: time::now() \
+				 };",
+			)
+			.bind(("id", record_key.clone()))
+			.bind(("key", lock_key.to_string()))
+			.bind(("owner", owner.clone()))
+			.await;
+
+		match create {
+			Ok(resp) => match resp.check() {
+				Ok(_) => return Ok(()),
+				Err(err) if is_lock_contention(&err.to_string()) => {
+					// Client may have lost the success response while the row
+					// landed — only treat as ours when owner matches THIS acquire.
+					if lock_held_by_us(db, &record_key, &owner).await? {
+						return Ok(());
+					}
+					if tokio::time::Instant::now() >= deadline {
+						bail!(
+							"could not acquire SurrealKit lock '{lock_key}' within {}s (held or contended)",
+							LOCK_WAIT.as_secs()
+						);
+					}
+					tokio::time::sleep(LOCK_POLL).await;
+				}
+				Err(err) => return Err(err.into()),
+			},
+			Err(err) if is_lock_contention(&err.to_string()) => {
+				if lock_held_by_us(db, &record_key, &owner).await? {
+					return Ok(());
+				}
+				if tokio::time::Instant::now() >= deadline {
+					bail!(
+						"could not acquire SurrealKit lock '{lock_key}' within {}s (held or contended)",
+						LOCK_WAIT.as_secs()
+					);
+				}
+				tokio::time::sleep(LOCK_POLL).await;
+			}
+			Err(err) => return Err(err.into()),
+		}
+	}
+}
+
+async fn lock_held_by_us(db: &Surreal<Any>, record_key: &str, owner: &str) -> Result<bool> {
+	let mut resp = db
+		.query("SELECT val FROM type::record('__entity', $id);")
+		.bind(("id", record_key.to_string()))
+		.await?;
+	let rows: Vec<serde_json::Value> = resp.take(0)?;
+	Ok(rows.first().and_then(|row| row.get("val")).and_then(|val| val.get("owner")).and_then(|v| v.as_str())
+		== Some(owner))
+}
+
+fn is_lock_contention(message: &str) -> bool {
+	message.contains("already contains")
+		|| message.contains("Resource busy")
+		|| message.contains("Transaction conflict")
+		|| message.contains("already exists")
 }
 
 pub async fn release_lock(db: &Surreal<Any>, lock_key: &str) -> Result<()> {
-	db.query("DELETE __entity WHERE ns = 'lock' AND key = $key;")
-		.bind(("key", lock_key.to_string()))
+	let record_key = lock_record_key(lock_key);
+	db.query("DELETE type::record('__entity', $id);")
+		.bind(("id", record_key))
 		.await?
 		.check()?;
 	Ok(())

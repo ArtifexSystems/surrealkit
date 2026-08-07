@@ -47,7 +47,6 @@ pub struct EmbeddedSchemaFile {
 }
 
 pub async fn run_sync(db: &Surreal<Any>, opts: SyncOpts) -> Result<()> {
-	run_setup(db).await?;
 	ensure_local_state_dirs()?;
 
 	if opts.watch {
@@ -107,7 +106,6 @@ pub async fn run_sync_embedded_with_opts(
 	files: &[EmbeddedSchemaFile],
 	opts: &SyncOpts,
 ) -> Result<()> {
-	run_setup(db).await?;
 	let schema_files: Vec<SchemaFile> = files
 		.iter()
 		.map(|f| {
@@ -138,109 +136,166 @@ async fn run_sync_with_files(
 	files: &[SchemaFile],
 	watch_mode: bool,
 ) -> Result<()> {
+	// Bounded retry for residual SurrealDB write conflicts (lock serializes the
+	// common path; AIEUS apply wrappers also retry these same shapes).
+	const DELAYS_MS: [u64; 5] = [50, 150, 300, 600, 1_200];
+	for (i, delay) in DELAYS_MS.iter().enumerate() {
+		match run_sync_with_files_once(db, opts, files, watch_mode).await {
+			Ok(()) => return Ok(()),
+			Err(err) => {
+				let msg = err.to_string();
+				let retryable = msg.contains("Transaction conflict")
+					|| msg.contains("Resource busy")
+					|| msg.contains("by_ns_key already contains")
+					|| msg.contains("could not acquire SurrealKit lock");
+				if opts.dry_run || !retryable || i + 1 == DELAYS_MS.len() {
+					return Err(err);
+				}
+				tokio::time::sleep(Duration::from_millis(*delay)).await;
+			}
+		}
+	}
+	unreachable!()
+}
+
+async fn run_sync_with_files_once(
+	db: &Surreal<Any>,
+	opts: &SyncOpts,
+	files: &[SchemaFile],
+	watch_mode: bool,
+) -> Result<()> {
 	let desired_catalog = build_catalog_snapshot(files)?;
-	let tracked = load_sync_hashes(db).await?;
-	let managed = load_managed_entities(db).await?;
 
 	if files.is_empty() && !watch_mode {
 		println!("No schema files found in database/schema");
 	}
 
 	let file_paths: BTreeSet<String> = files.iter().map(|file| file.path.clone()).collect();
-	let removed_paths: Vec<String> =
-		tracked.keys().filter(|path| !file_paths.contains(*path)).cloned().collect();
 
-	let mut changed_count = 0usize;
-	let mut apply_errors = 0usize;
-	let mut synced_paths = BTreeSet::new();
-	let mut failed_paths = BTreeSet::new();
-	for file in files {
-		let tracked_hash = tracked.get(&file.path);
-		if tracked_hash == Some(&file.hash) {
-			continue;
-		}
+	// Ensure ledger tables exist before the apply lock. Concurrent setup is
+	// retried: DEFINE OVERWRITE can briefly conflict under mem/rocks writers.
+	retry_setup(db).await?;
 
-		changed_count += 1;
-		if opts.dry_run {
-			if !watch_mode {
-				println!("DRY RUN: would apply {}", file.path);
+	// Non-dry-run applies hold the global lock across catalog load + DDL + ledger
+	// mutation so concurrent syncs serialize end-to-end.
+	let hold_lock = !opts.dry_run;
+	if hold_lock {
+		acquire_lock(db, "global").await?;
+	}
+	let result = async {
+		let tracked = load_sync_hashes(db).await?;
+		let managed = load_managed_entities(db).await?;
+		let removed_paths: Vec<String> =
+			tracked.keys().filter(|path| !file_paths.contains(*path)).cloned().collect();
+
+
+		let mut changed_count = 0usize;
+		let mut apply_errors = 0usize;
+		let mut synced_paths = BTreeSet::new();
+		let mut failed_paths = BTreeSet::new();
+		for file in files {
+			let tracked_hash = tracked.get(&file.path);
+			if tracked_hash == Some(&file.hash) {
+				continue;
 			}
-			synced_paths.insert(file.path.clone());
-			continue;
-		}
 
-		let substituted = opts
-			.vars
-			.apply(&file.sql)
-			.with_context(|| format!("applying template variables in {}", file.path))?;
-		let sql = ensure_overwrite(&substituted);
-		match exec_surql(db, &sql).await {
-			Ok(_) => {
+			changed_count += 1;
+			if opts.dry_run {
 				if !watch_mode {
-					println!("applied {}", file.path);
+					println!("DRY RUN: would apply {}", file.path);
 				}
-				store_sync_hash(db, &file.path, &file.hash).await?;
 				synced_paths.insert(file.path.clone());
+				continue;
 			}
-			Err(err) => {
-				apply_errors += 1;
-				failed_paths.insert(file.path.clone());
-				eprintln!("error applying {}: {err:#}", file.path);
-				if opts.fail_fast {
-					return Err(err);
+
+			let substituted = opts
+				.vars
+				.apply(&file.sql)
+				.with_context(|| format!("applying template variables in {}", file.path))?;
+			let sql = ensure_overwrite(&substituted);
+			match exec_surql(db, &sql).await {
+				Ok(_) => {
+					if !watch_mode {
+						println!("applied {}", file.path);
+					}
+					store_sync_hash(db, &file.path, &file.hash).await?;
+					synced_paths.insert(file.path.clone());
+				}
+				Err(err) => {
+					apply_errors += 1;
+					failed_paths.insert(file.path.clone());
+					eprintln!("error applying {}: {err:#}", file.path);
+					if opts.fail_fast {
+						return Err(err);
+					}
 				}
 			}
 		}
-	}
 
-	let effective_entities: Vec<CatalogEntity> = desired_catalog
-		.entities
-		.iter()
-		.filter(|entity| !failed_paths.contains(&entity.source_path))
-		.cloned()
-		.collect();
-	let effective_keys: BTreeSet<EntityKey> =
-		effective_entities.iter().map(CatalogEntity::key).collect();
+		let effective_entities: Vec<CatalogEntity> = desired_catalog
+			.entities
+			.iter()
+			.filter(|entity| !failed_paths.contains(&entity.source_path))
+			.cloned()
+			.collect();
+		let effective_keys: BTreeSet<EntityKey> =
+			effective_entities.iter().map(CatalogEntity::key).collect();
 
-	let stale_records: Vec<_> = managed
-		.iter()
-		.filter(|record| {
-			!effective_keys.contains(&record.entity.key())
-				&& !failed_paths.contains(&record.entity.source_path)
-		})
-		.cloned()
-		.collect();
-	let stale_entities: Vec<EntityKey> =
-		stale_records.iter().map(|record| record.entity.key()).collect();
-	let stale_count = stale_entities.len();
-	let destructive_change = stale_count > 0;
+		let stale_records: Vec<_> = managed
+			.iter()
+			.filter(|record| {
+				!effective_keys.contains(&record.entity.key())
+					&& !failed_paths.contains(&record.entity.source_path)
+			})
+			.cloned()
+			.collect();
+		let stale_entities: Vec<EntityKey> =
+			stale_records.iter().map(|record| record.entity.key()).collect();
+		let stale_count = stale_entities.len();
+		let destructive_change = stale_count > 0;
 
-	let shared = if destructive_change {
-		detect_shared_db(db).await?
-	} else {
-		false
-	};
-	if destructive_change {
-		if load_active_rollout_id(db).await?.is_some() {
-			bail!("refusing destructive sync while a rollout is active");
+		let shared = if destructive_change {
+			detect_shared_db(db).await?
+		} else {
+			false
+		};
+		if destructive_change {
+			if load_active_rollout_id(db).await?.is_some() {
+				bail!("refusing destructive sync while a rollout is active");
+			}
+			if shared && !opts.allow_shared_prune {
+				bail!(
+					"database is marked shared; refusing stale prune without --allow-shared-prune"
+				);
+			}
 		}
-		if shared && !opts.allow_shared_prune {
-			bail!("database is marked shared; refusing stale prune without --allow-shared-prune");
-		}
-	}
 
-	if !opts.dry_run {
-		upsert_managed_entities(db, &effective_entities, None, "active").await?;
-		if !removed_paths.is_empty() {
-			delete_sync_hashes(db, &removed_paths).await?;
-		}
-	}
-
-	let mut pruned_count = 0usize;
-	if opts.prune && stale_count > 0 {
-		let remove_sql = render_remove_sql(&stale_entities, true)?;
-		let over_max_prune = opts.max_prune > 0 && stale_count > opts.max_prune;
-		if opts.dry_run {
+		let mut pruned_count = 0usize;
+		if !opts.dry_run {
+			upsert_managed_entities(db, &effective_entities, None, "active").await?;
+			if !removed_paths.is_empty() {
+				delete_sync_hashes(db, &removed_paths).await?;
+			}
+			if opts.prune && stale_count > 0 {
+				let over_max_prune = opts.max_prune > 0 && stale_count > opts.max_prune;
+				if over_max_prune {
+					bail!(
+						"refusing to prune {} stale managed entities; --max-prune limit is {}. \
+						 Run `surrealkit sync --dry-run` to review the list. If the prune is \
+						 intentional, rerun with `--max-prune {}` (or `--max-prune 0` for unlimited).",
+						stale_count,
+						opts.max_prune,
+						stale_count
+					);
+				}
+				prune_managed_entities(db, &stale_entities).await?;
+				pruned_count = stale_count;
+			}
+			write_meta_from_env(db).await?;
+			store_last_sync_meta(db).await?;
+		} else if opts.prune && stale_count > 0 {
+			let remove_sql = render_remove_sql(&stale_entities, true)?;
+			let over_max_prune = opts.max_prune > 0 && stale_count > opts.max_prune;
 			if !watch_mode {
 				if over_max_prune {
 					println!(
@@ -255,57 +310,40 @@ async fn run_sync_with_files(
 					println!("  {}", stmt);
 				}
 			}
-		} else if over_max_prune {
-			bail!(
-				"refusing to prune {} stale managed entities; --max-prune limit is {}. \
-				 Run `surrealkit sync --dry-run` to review the list. If the prune is \
-				 intentional, rerun with `--max-prune {}` (or `--max-prune 0` for unlimited).",
-				stale_count,
-				opts.max_prune,
-				stale_count
-			);
-		} else if shared {
-			acquire_lock(db, "global").await?;
-			let result = prune_managed_entities(db, &stale_entities).await;
-			let release = release_lock(db, "global").await;
-			match (result, release) {
-				(Err(err), _) => return Err(err),
-				(Ok(_), Err(err)) => return Err(err),
-				(Ok(()), Ok(())) => {}
-			}
-			pruned_count = stale_count;
-		} else {
-			prune_managed_entities(db, &stale_entities).await?;
-			pruned_count = stale_count;
+		}
+
+		Ok((changed_count, apply_errors, pruned_count, stale_count, removed_paths.len()))
+	}
+	.await;
+
+	if hold_lock {
+		let release = release_lock(db, "global").await;
+		match (&result, release) {
+			(Err(_), _) => {}
+			(_, Err(err)) => return Err(err),
+			_ => {}
 		}
 	}
 
-	if !opts.dry_run {
-		write_meta_from_env(db).await?;
-		store_last_sync_meta(db).await?;
-	}
+	let (changed_count, apply_errors, pruned_count, stale_count, removed_count) = result?;
 
 	if watch_mode {
-		let has_changes = changed_count > 0 || stale_count > 0 || !removed_paths.is_empty();
+		let has_changes = changed_count > 0 || stale_count > 0 || removed_count > 0;
 		if has_changes {
 			if opts.dry_run {
 				println!(
 					"Change detected (dry-run): {} schema file(s), {} stale entity(ies), {} stale tracking file(s) would be reconciled.",
-					changed_count,
-					stale_count,
-					removed_paths.len()
+					changed_count, stale_count, removed_count
 				);
 			} else {
 				println!(
 					"Change detected and pushed: {} schema file(s) synced, {} stale entity(ies) pruned, {} stale tracking file(s) removed.",
-					changed_count,
-					pruned_count,
-					removed_paths.len()
+					changed_count, pruned_count, removed_count
 				);
 			}
 			let _ = std::io::stdout().flush();
 		}
-	} else if changed_count == 0 && removed_paths.is_empty() && stale_count == 0 {
+	} else if changed_count == 0 && removed_count == 0 && stale_count == 0 {
 		println!("schema already in sync");
 	}
 
@@ -320,6 +358,26 @@ async fn run_sync_with_files(
 	}
 
 	Ok(())
+}
+
+async fn retry_setup(db: &Surreal<Any>) -> Result<()> {
+	const DELAYS_MS: [u64; 5] = [25, 50, 100, 200, 400];
+	for (i, delay) in DELAYS_MS.iter().enumerate() {
+		match run_setup(db).await {
+			Ok(()) => return Ok(()),
+			Err(err) => {
+				let msg = err.to_string();
+				let retryable = msg.contains("Transaction conflict")
+					|| msg.contains("Resource busy")
+					|| msg.contains("already contains");
+				if !retryable || i + 1 == DELAYS_MS.len() {
+					return Err(err);
+				}
+				tokio::time::sleep(Duration::from_millis(*delay)).await;
+			}
+		}
+	}
+	unreachable!()
 }
 
 async fn prune_managed_entities(db: &Surreal<Any>, stale_entities: &[EntityKey]) -> Result<()> {
@@ -348,13 +406,13 @@ async fn load_sync_hashes(db: &Surreal<Any>) -> Result<BTreeMap<String, String>>
 
 async fn store_sync_hash(db: &Surreal<Any>, path: &str, hash: &str) -> Result<()> {
 	db.query(
-        "DELETE __entity WHERE ns = 'sync' AND key = $path; \
-		 CREATE __entity CONTENT { ns: 'sync', key: $path, val: { hash: $hash }, updated_at: time::now() };",
-    )
-    .bind(("path", path.to_string()))
-    .bind(("hash", hash.to_string()))
-    .await?
-    .check()?;
+		"UPSERT __entity SET ns = 'sync', key = $path, val = { hash: $hash }, updated_at = time::now() \
+		 WHERE ns = 'sync' AND key = $path;",
+	)
+	.bind(("path", path.to_string()))
+	.bind(("hash", hash.to_string()))
+	.await?
+	.check()?;
 	Ok(())
 }
 
@@ -393,8 +451,8 @@ async fn store_last_sync_meta(db: &Surreal<Any>) -> Result<()> {
 
 async fn upsert_meta(db: &Surreal<Any>, key: &str, value: serde_json::Value) -> Result<()> {
 	db.query(
-		"DELETE __entity WHERE ns = 'meta' AND key = $key; \
-		 CREATE __entity CONTENT { ns: 'meta', key: $key, val: $value, updated_at: time::now() };",
+		"UPSERT __entity SET ns = 'meta', key = $key, val = $value, updated_at = time::now() \
+		 WHERE ns = 'meta' AND key = $key;",
 	)
 	.bind(("key", key.to_string()))
 	.bind(("value", value))
