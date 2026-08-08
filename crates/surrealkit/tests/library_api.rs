@@ -973,6 +973,110 @@ async fn concurrent_managed_entity_upserts_do_not_trip_unique_index() {
 }
 
 #[tokio::test]
+async fn live_lock_renewal_prevents_stale_steal() {
+	use surrealkit::{acquire_lock, release_lock};
+
+	// Short TTL so the test finishes quickly; renewer keeps the lease live.
+	unsafe { std::env::set_var("SURREALKIT_LOCK_STALE_SECS", "1") };
+
+	let db = mem_db().await;
+	run_setup(&db).await.expect("setup");
+
+	acquire_lock(&db, "renew").await.expect("acquire");
+	tokio::time::sleep(std::time::Duration::from_millis(2500)).await;
+
+	let second = tokio::time::timeout(
+		std::time::Duration::from_secs(2),
+		acquire_lock(&db, "renew"),
+	)
+	.await;
+	assert!(
+		matches!(second, Ok(Err(_)) | Err(_)),
+		"second acquire must not steal a live renewed lease: {second:?}"
+	);
+
+	release_lock(&db, "renew").await.expect("release");
+	acquire_lock(&db, "renew").await.expect("acquire after release");
+	release_lock(&db, "renew").await.expect("final release");
+
+	unsafe { std::env::remove_var("SURREALKIT_LOCK_STALE_SECS") };
+}
+
+#[tokio::test]
+async fn legacy_random_id_stale_lock_is_reclaimed() {
+	use surrealkit::{acquire_lock, release_lock};
+
+	unsafe { std::env::set_var("SURREALKIT_LOCK_STALE_SECS", "1") };
+
+	let db = mem_db().await;
+	run_setup(&db).await.expect("setup");
+
+	// Pre-aieus.10 style: random record id, same ns/key — UNIQUE by_ns_key still
+	// blocks CREATE ONLY on the deterministic id until the stale row is cleared.
+	db.query(
+		"CREATE __entity CONTENT { \
+		 	ns: 'lock', \
+		 	key: 'legacy', \
+		 	val: { owner: 'old-format' }, \
+		 	updated_at: time::now() - 10m \
+		 };",
+	)
+	.await
+	.expect("insert legacy")
+	.check()
+	.expect("check legacy");
+
+	acquire_lock(&db, "legacy")
+		.await
+		.expect("reclaim legacy random-id stale lock");
+	release_lock(&db, "legacy").await.expect("release");
+
+	unsafe { std::env::remove_var("SURREALKIT_LOCK_STALE_SECS") };
+}
+
+#[tokio::test]
+async fn former_owner_cannot_release_successor_lock() {
+	use surrealkit::{acquire_lock, release_lock};
+
+	let db = mem_db().await;
+	run_setup(&db).await.expect("setup");
+
+	acquire_lock(&db, "hand-off").await.expect("first acquire");
+	// Simulate a successor lease after reclaim: same deterministic id, new owner.
+	db.query(
+		"UPDATE type::record('__entity', 'lock_hand_off') SET \
+		 	val = { owner: 'successor' }, \
+		 	updated_at = time::now();",
+	)
+	.await
+	.expect("install successor")
+	.check()
+	.expect("check successor");
+
+	release_lock(&db, "hand-off")
+		.await
+		.expect("former holder release is owner-bound");
+
+	let mut resp = db
+		.query("SELECT val.owner AS owner FROM type::record('__entity', 'lock_hand_off');")
+		.await
+		.expect("select");
+	let rows: Vec<serde_json::Value> = resp.take(0).expect("take");
+	assert_eq!(
+		rows.first().and_then(|r| r.get("owner")).and_then(|v| v.as_str()),
+		Some("successor"),
+		"successor lease must survive former owner's release: {rows:?}"
+	);
+
+	// Clean up without going through release_lock (we no longer hold the map entry).
+	db.query("DELETE type::record('__entity', 'lock_hand_off');")
+		.await
+		.expect("cleanup")
+		.check()
+		.expect("cleanup check");
+}
+
+#[tokio::test]
 async fn concurrent_sync_embedded_serializes_without_unique_index_death() {
 	let db = mem_db().await;
 	run_setup(&db).await.expect("setup once before concurrent syncs");

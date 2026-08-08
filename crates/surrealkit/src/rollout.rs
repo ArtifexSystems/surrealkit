@@ -1,6 +1,7 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 
 use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
@@ -1386,13 +1387,34 @@ fn step_checksum(step: &RolloutStep) -> Result<String> {
 	Ok(sha256_hex(&raw))
 }
 
-/// Stale lock TTL: a crashed holder older than this can be reclaimed.
+/// Default stale lock TTL: a crashed holder older than this can be reclaimed.
+/// Override with `SURREALKIT_LOCK_STALE_SECS` (tests use a short TTL).
 pub const LOCK_STALE: std::time::Duration = std::time::Duration::from_secs(300);
 /// Bounded wait when another live apply holds the lock.
 pub const LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
 const LOCK_POLL: std::time::Duration = std::time::Duration::from_millis(100);
 
 static LOCK_OWNER_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+struct HeldLock {
+	owner: String,
+	renew_abort: tokio::task::AbortHandle,
+}
+
+fn held_locks() -> &'static Mutex<HashMap<String, HeldLock>> {
+	static HELD: OnceLock<Mutex<HashMap<String, HeldLock>>> = OnceLock::new();
+	HELD.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn lock_stale_duration() -> std::time::Duration {
+	match std::env::var("SURREALKIT_LOCK_STALE_SECS") {
+		Ok(raw) => match raw.parse::<u64>() {
+			Ok(secs) if secs > 0 => std::time::Duration::from_secs(secs),
+			_ => LOCK_STALE,
+		},
+		Err(_) => LOCK_STALE,
+	}
+}
 
 fn lock_record_key(lock_key: &str) -> String {
 	let mut out = String::from("lock_");
@@ -1412,20 +1434,27 @@ fn lock_owner_id() -> String {
 	format!("{base}:{}:{seq}", std::process::id())
 }
 
-/// Compare-and-set schema-apply lock. A live holder blocks (bounded wait +
-/// retry); a stale holder (`updated_at` older than [`LOCK_STALE`]) is reclaimed.
-/// Uses a deterministic `__entity` record id so two contenders cannot both
-/// observe a successful create against the same lock key.
+/// Compare-and-set schema-apply lock with an owner-bound renewable lease.
+///
+/// A live holder renews `updated_at` so a long apply cannot be reaped at the
+/// stale TTL. A stale holder (`updated_at` older than the TTL) is reclaimed —
+/// including pre-deterministic random `__entity` record ids that share the
+/// same `ns`/`key`. Release only deletes rows owned by this acquire.
 pub async fn acquire_lock(db: &Surreal<Any>, lock_key: &str) -> Result<()> {
 	let owner = lock_owner_id();
 	let record_key = lock_record_key(lock_key);
+	let stale = lock_stale_duration();
 	let deadline = tokio::time::Instant::now() + LOCK_WAIT;
 	loop {
-		// Drop only expired holders so a live lock cannot be stolen.
+		// Reclaim expired holders by ns/key (covers legacy random record ids)
+		// and by the deterministic id used since aieus.10.
 		db.query(&format!(
-			"DELETE type::record('__entity', $id) WHERE updated_at < time::now() - {}s;",
-			LOCK_STALE.as_secs()
+			"DELETE __entity WHERE ns = 'lock' AND key = $key AND updated_at < time::now() - {}s; \
+			 DELETE type::record('__entity', $id) WHERE updated_at < time::now() - {}s;",
+			stale.as_secs(),
+			stale.as_secs()
 		))
+		.bind(("key", lock_key.to_string()))
 		.bind(("id", record_key.clone()))
 		.await?
 		.check()?;
@@ -1446,11 +1475,15 @@ pub async fn acquire_lock(db: &Surreal<Any>, lock_key: &str) -> Result<()> {
 
 		match create {
 			Ok(resp) => match resp.check() {
-				Ok(_) => return Ok(()),
+				Ok(_) => {
+					start_lock_renewal(db.clone(), lock_key, &record_key, &owner, stale);
+					return Ok(());
+				}
 				Err(err) if is_lock_contention(&err.to_string()) => {
 					// Client may have lost the success response while the row
 					// landed — only treat as ours when owner matches THIS acquire.
 					if lock_held_by_us(db, &record_key, &owner).await? {
+						start_lock_renewal(db.clone(), lock_key, &record_key, &owner, stale);
 						return Ok(());
 					}
 					if tokio::time::Instant::now() >= deadline {
@@ -1465,6 +1498,7 @@ pub async fn acquire_lock(db: &Surreal<Any>, lock_key: &str) -> Result<()> {
 			},
 			Err(err) if is_lock_contention(&err.to_string()) => {
 				if lock_held_by_us(db, &record_key, &owner).await? {
+					start_lock_renewal(db.clone(), lock_key, &record_key, &owner, stale);
 					return Ok(());
 				}
 				if tokio::time::Instant::now() >= deadline {
@@ -1480,13 +1514,63 @@ pub async fn acquire_lock(db: &Surreal<Any>, lock_key: &str) -> Result<()> {
 	}
 }
 
+fn start_lock_renewal(
+	db: Surreal<Any>,
+	lock_key: &str,
+	record_key: &str,
+	owner: &str,
+	stale: std::time::Duration,
+) {
+	let renew_every = (stale / 3).max(std::time::Duration::from_millis(50));
+	let record_key = record_key.to_string();
+	let owner_for_task = owner.to_string();
+	let owner_for_map = owner.to_string();
+	let handle = tokio::spawn(async move {
+		loop {
+			tokio::time::sleep(renew_every).await;
+			let updated = db
+				.query(
+					"UPDATE type::record('__entity', $id) SET updated_at = time::now() \
+					 WHERE val.owner = $owner RETURN id;",
+				)
+				.bind(("id", record_key.clone()))
+				.bind(("owner", owner_for_task.clone()))
+				.await;
+			let Ok(mut resp) = updated else {
+				break;
+			};
+			let Ok(rows): Result<Vec<serde_json::Value>, _> = resp.take(0) else {
+				break;
+			};
+			if rows.is_empty() {
+				// Lost the lease (reaped or overwritten) — stop renewing.
+				break;
+			}
+		}
+	});
+	let mut map = held_locks().lock().expect("held lock map");
+	if let Some(prev) = map.insert(
+		lock_key.to_string(),
+		HeldLock {
+			owner: owner_for_map,
+			renew_abort: handle.abort_handle(),
+		},
+	) {
+		prev.renew_abort.abort();
+	}
+}
+
 async fn lock_held_by_us(db: &Surreal<Any>, record_key: &str, owner: &str) -> Result<bool> {
 	let mut resp = db
 		.query("SELECT val FROM type::record('__entity', $id);")
 		.bind(("id", record_key.to_string()))
 		.await?;
 	let rows: Vec<serde_json::Value> = resp.take(0)?;
-	Ok(rows.first().and_then(|row| row.get("val")).and_then(|val| val.get("owner")).and_then(|v| v.as_str())
+	Ok(rows
+		.first()
+		.and_then(|row| row.get("val"))
+		.and_then(|val| val.get("owner"))
+		.and_then(|v| v.as_str())
 		== Some(owner))
 }
 
@@ -1497,12 +1581,27 @@ fn is_lock_contention(message: &str) -> bool {
 		|| message.contains("already exists")
 }
 
+/// Release only the lock owned by this process's matching acquire. A former
+/// holder cannot delete a successor's lease after stale reclaim.
 pub async fn release_lock(db: &Surreal<Any>, lock_key: &str) -> Result<()> {
+	let held = {
+		let mut map = held_locks().lock().expect("held lock map");
+		map.remove(lock_key)
+	};
+	let Some(held) = held else {
+		return Ok(());
+	};
+	held.renew_abort.abort();
 	let record_key = lock_record_key(lock_key);
-	db.query("DELETE type::record('__entity', $id);")
-		.bind(("id", record_key))
-		.await?
-		.check()?;
+	db.query(
+		"DELETE type::record('__entity', $id) WHERE val.owner = $owner; \
+		 DELETE __entity WHERE ns = 'lock' AND key = $key AND val.owner = $owner;",
+	)
+	.bind(("id", record_key))
+	.bind(("key", lock_key.to_string()))
+	.bind(("owner", held.owner))
+	.await?
+	.check()?;
 	Ok(())
 }
 
