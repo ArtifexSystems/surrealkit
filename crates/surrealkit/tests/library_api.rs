@@ -1163,3 +1163,102 @@ async fn concurrent_sync_embedded_serializes_without_unique_index_death() {
 	);
 	assert_eq!(key_set.len(), 3, "no spurious prune; keys={key_set:?}");
 }
+
+fn write_rel(dir: &Path, rel: &str, body: &str) {
+	let path = dir.join(rel);
+	if let Some(parent) = path.parent() {
+		std::fs::create_dir_all(parent).expect("create parent");
+	}
+	std::fs::write(&path, body).expect("write file");
+}
+
+fn threshold_core_and_extension_fixture(dir: &Path) {
+	for i in 0..6 {
+		write_rel(
+			dir,
+			&format!("database/schema/020_tables/old_{i}.surql"),
+			&format!(
+				"DEFINE TABLE person SCHEMAFULL;\n\
+DEFINE FIELD f{} ON person TYPE string;\n\
+DEFINE FIELD f{} ON person TYPE string;\n",
+				2 * i,
+				2 * i + 1
+			),
+		);
+	}
+	write_rel(
+		dir,
+		"database/schema/900_extension/tenant.surql",
+		"DEFINE TABLE tenant_quote SCHEMAFULL;\n\
+DEFINE FIELD body ON tenant_quote TYPE string;\n",
+	);
+	write_rel(
+		dir,
+		"database/surrealkit.toml",
+		"[rollouts]\ntarget_hash_exclude_prefixes = [\"database/schema/900_extension/\"]\n",
+	);
+}
+
+fn mutate_threshold_core(dir: &Path) {
+	for i in 0..6 {
+		write_rel(
+			dir,
+			&format!("database/schema/020_tables/old_{i}.surql"),
+			&format!(
+				"DEFINE TABLE person SCHEMAFULL;\n\
+DEFINE FIELD f{} ON person TYPE int;\n\
+DEFINE FIELD f{} ON person TYPE int;\n",
+				2 * i,
+				2 * i + 1
+			),
+		);
+	}
+}
+
+#[tokio::test]
+async fn run_plan_refuses_modified_extension_with_threshold_core_drift() {
+	let _guard = FS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+	let (tmp, _restore) = enter_tempdir();
+	let db = mem_db().await;
+	threshold_core_and_extension_fixture(tmp.path());
+	run_baseline(&db).await.expect("baseline");
+	mutate_threshold_core(tmp.path());
+	write_rel(
+		tmp.path(),
+		"database/schema/900_extension/tenant.surql",
+		"DEFINE TABLE tenant_quote SCHEMAFULL;\n\
+DEFINE FIELD body ON tenant_quote TYPE int;\n",
+	);
+	let err = run_plan(RolloutPlanOpts {
+		name: Some("threshold_modified_extension".to_string()),
+		dry_run: true,
+	})
+	.await
+	.expect_err("run_plan must refuse declared extension modification");
+	let message = err.to_string();
+	assert!(message.contains("refuses modified"), "{message}");
+	assert!(message.contains("field:tenant_quote.body"), "{message}");
+	assert!(!message.contains("field:person.f0"), "{message}");
+}
+
+#[tokio::test]
+async fn run_plan_refuses_removed_extension_with_threshold_core_drift() {
+	let _guard = FS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+	let (tmp, _restore) = enter_tempdir();
+	let db = mem_db().await;
+	threshold_core_and_extension_fixture(tmp.path());
+	run_baseline(&db).await.expect("baseline");
+	mutate_threshold_core(tmp.path());
+	std::fs::remove_file(tmp.path().join("database/schema/900_extension/tenant.surql"))
+		.expect("remove declared extension file");
+	let err = run_plan(RolloutPlanOpts {
+		name: Some("threshold_removed_extension".to_string()),
+		dry_run: true,
+	})
+	.await
+	.expect_err("run_plan must refuse declared extension removal");
+	let message = err.to_string();
+	assert!(message.contains("refuses removed"), "{message}");
+	assert!(message.contains("table:tenant_quote"), "{message}");
+	assert!(!message.contains("field:person.f0"), "{message}");
+}
