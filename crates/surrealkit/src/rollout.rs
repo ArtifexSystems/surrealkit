@@ -45,9 +45,10 @@ struct RolloutProjectConfig {
 
 #[derive(Debug, Default, Deserialize)]
 struct RolloutConfig {
-	/// Project-root-relative schema-directory prefixes omitted only from rollout
-	/// source/target hash computation. The complete schema tree is still parsed,
-	/// applied, and retained in the desired catalog.
+	/// Project-root-relative schema-directory prefixes that name the declared
+	/// extension transition: omitted from source/target hash computation, and
+	/// used as the autoplan classification boundary when set. The complete
+	/// schema tree is still parsed, applied, and retained in the desired catalog.
 	#[serde(default)]
 	target_hash_exclude_prefixes: Vec<String>,
 }
@@ -68,6 +69,63 @@ impl RolloutHashScope {
 			!self.exclude_prefixes.iter().any(|prefix| entry.path.starts_with(prefix))
 		});
 		hash_schema_snapshot(&filtered)
+	}
+
+	fn path_is_declared_transition(&self, path: &str) -> bool {
+		self.exclude_prefixes.iter().any(|prefix| path.starts_with(prefix))
+	}
+
+	/// When exclusion prefixes are configured, autoplan classifies only the
+	/// declared extension transition (paths under those prefixes). Unrelated
+	/// managed-core snapshot drift is ignored for classification; fingerprints
+	/// still hash the managed-core complement, and the full catalog is retained.
+	fn scope_file_diff_for_autoplan(&self, diff: FileDiff) -> FileDiff {
+		if self.exclude_prefixes.is_empty() {
+			return diff;
+		}
+		FileDiff {
+			added: diff
+				.added
+				.into_iter()
+				.filter(|path| self.path_is_declared_transition(path))
+				.collect(),
+			modified: diff
+				.modified
+				.into_iter()
+				.filter(|path| self.path_is_declared_transition(path))
+				.collect(),
+			removed: diff
+				.removed
+				.into_iter()
+				.filter(|path| self.path_is_declared_transition(path))
+				.collect(),
+		}
+	}
+
+	fn scope_catalog_diff_for_autoplan(&self, diff: CatalogDiff) -> CatalogDiff {
+		if self.exclude_prefixes.is_empty() {
+			return diff;
+		}
+		CatalogDiff {
+			added: diff
+				.added
+				.into_iter()
+				.filter(|entity| self.path_is_declared_transition(&entity.source_path))
+				.collect(),
+			removed: diff
+				.removed
+				.into_iter()
+				.filter(|entity| self.path_is_declared_transition(&entity.source_path))
+				.collect(),
+			modified: diff
+				.modified
+				.into_iter()
+				.filter(|change| {
+					self.path_is_declared_transition(&change.old.source_path)
+						|| self.path_is_declared_transition(&change.new.source_path)
+				})
+				.collect(),
+		}
 	}
 }
 
@@ -264,6 +322,13 @@ pub async fn run_plan(opts: RolloutPlanOpts) -> Result<()> {
 	// baseline for that drift and plan only truly added files/entities.
 	let (file_diff, catalog_diff, stale_caught_up) =
 		reconcile_stale_baseline_for_autoplan(file_diff, catalog_diff);
+
+	// Classify the declared transition only. Hash exclusion prefixes name the
+	// additive extension area; managed-core drift outside that area must not
+	// false-refuse an extension plan. Full parse/apply/catalog retention is
+	// unchanged — only autoplan classification and planned steps are scoped.
+	let file_diff = hash_scope.scope_file_diff_for_autoplan(file_diff);
+	let catalog_diff = hash_scope.scope_catalog_diff_for_autoplan(catalog_diff);
 
 	validate_autoplan(&catalog_diff)?;
 
@@ -942,12 +1007,19 @@ fn reconcile_stale_baseline_for_autoplan(
 	)
 }
 
+fn entity_label(kind: &str, scope: &Option<String>, name: &str) -> String {
+	match scope {
+		Some(scope) => format!("{kind}:{scope}.{name}"),
+		None => format!("{kind}:{name}"),
+	}
+}
+
 fn validate_autoplan(diff: &CatalogDiff) -> Result<()> {
 	if !diff.modified.is_empty() {
 		let names = diff
 			.modified
 			.iter()
-			.map(|change| format!("{}:{}", change.old.kind, change.old.name))
+			.map(|change| entity_label(&change.old.kind, &change.old.scope, &change.old.name))
 			.collect::<Vec<_>>()
 			.join(", ");
 		bail!(
@@ -957,15 +1029,17 @@ Author a manual rollout manifest for non-additive changes.",
 		);
 	}
 
-	let removed_by_scope: BTreeSet<(String, Option<String>)> =
-		diff.removed.iter().map(|entity| (entity.kind.clone(), entity.scope.clone())).collect();
-	let added_by_scope: BTreeSet<(String, Option<String>)> =
-		diff.added.iter().map(|entity| (entity.kind.clone(), entity.scope.clone())).collect();
-
-	if removed_by_scope.intersection(&added_by_scope).next().is_some() {
+	if !diff.removed.is_empty() {
+		let names = diff
+			.removed
+			.iter()
+			.map(|entity| entity_label(&entity.kind, &entity.scope, &entity.name))
+			.collect::<Vec<_>>()
+			.join(", ");
 		bail!(
-			"automatic rollout planning detected add/remove changes in the same scope. \
-Author a manual rollout manifest with explicit renames/backfill steps."
+			"automatic rollout planning refuses removed managed entities: {}. \
+Author a manual rollout manifest for non-additive changes.",
+			names
 		);
 	}
 
@@ -1877,6 +1951,175 @@ target_hash_exclude_prefixes = ["database/schema/900_extension/"]
 		);
 		let catalog = build_catalog_snapshot(&[core, extension]).expect("full desired catalog");
 		assert_eq!(catalog.entities.len(), 2, "hash exclusion must not filter the catalog");
+	}
+
+	fn core_field_change(file_hash_old: &str, file_hash_new: &str) -> CatalogChange {
+		CatalogChange {
+			old: CatalogEntity {
+				kind: "field".to_string(),
+				scope: Some("person".to_string()),
+				name: "name".to_string(),
+				source_path: "database/schema/020_tables/person.surql".to_string(),
+				statement_hash: "a".to_string(),
+				file_hash: file_hash_old.to_string(),
+			},
+			new: CatalogEntity {
+				kind: "field".to_string(),
+				scope: Some("person".to_string()),
+				name: "name".to_string(),
+				source_path: "database/schema/020_tables/person.surql".to_string(),
+				statement_hash: "b".to_string(),
+				file_hash: file_hash_new.to_string(),
+			},
+		}
+	}
+
+	fn extension_table(name: &str) -> CatalogEntity {
+		CatalogEntity {
+			kind: "table".to_string(),
+			scope: None,
+			name: name.to_string(),
+			source_path: "database/schema/900_extension/tenant.surql".to_string(),
+			statement_hash: "ext".to_string(),
+			file_hash: "ext".to_string(),
+		}
+	}
+
+	fn extension_scope() -> RolloutHashScope {
+		parse_rollout_hash_scope(
+			r#"
+[rollouts]
+target_hash_exclude_prefixes = ["database/schema/900_extension/"]
+"#,
+			Path::new("database/surrealkit.toml"),
+		)
+		.expect("valid rollout hash scope")
+	}
+
+	#[test]
+	fn autoplan_scopes_classification_to_declared_extension_transition() {
+		let scope = extension_scope();
+		let file_diff = FileDiff {
+			added: vec!["database/schema/900_extension/tenant.surql".to_string()],
+			modified: vec!["database/schema/020_tables/person.surql".to_string()],
+			removed: Vec::new(),
+		};
+		let catalog_diff = CatalogDiff {
+			added: vec![extension_table("tenant_quote")],
+			removed: Vec::new(),
+			modified: vec![core_field_change("old-core", "new-core")],
+		};
+		let files = scope.scope_file_diff_for_autoplan(file_diff);
+		let entities = scope.scope_catalog_diff_for_autoplan(catalog_diff);
+		assert_eq!(files.added, vec!["database/schema/900_extension/tenant.surql".to_string()]);
+		assert!(files.modified.is_empty(), "unrelated core file drift is not the declared transition");
+		assert_eq!(entities.added.len(), 1);
+		assert!(entities.modified.is_empty());
+		validate_autoplan(&entities).expect("extension add plus unrelated core drift must plan");
+
+		let old = SchemaSnapshot {
+			version: 1,
+			files: vec![SchemaSnapshotEntry {
+				path: "database/schema/020_tables/person.surql".to_string(),
+				hash: "old-core".to_string(),
+			}],
+		};
+		let new_core_only = SchemaSnapshot {
+			version: 1,
+			files: vec![SchemaSnapshotEntry {
+				path: "database/schema/020_tables/person.surql".to_string(),
+				hash: "new-core".to_string(),
+			}],
+		};
+		let new_with_extension = SchemaSnapshot {
+			version: 1,
+			files: vec![
+				SchemaSnapshotEntry {
+					path: "database/schema/020_tables/person.surql".to_string(),
+					hash: "new-core".to_string(),
+				},
+				SchemaSnapshotEntry {
+					path: "database/schema/900_extension/tenant.surql".to_string(),
+					hash: "ext".to_string(),
+				},
+			],
+		};
+		let source = scope.hash_snapshot(&old).unwrap();
+		let target = scope.hash_snapshot(&new_with_extension).unwrap();
+		assert_eq!(source.len(), 64);
+		assert_eq!(target.len(), 64);
+		assert_ne!(source, target, "core drift is visible in managed-core fingerprints");
+		assert_eq!(
+			target,
+			scope.hash_snapshot(&new_core_only).unwrap(),
+			"extension files must not enter source/target hashes"
+		);
+	}
+
+	#[test]
+	fn autoplan_refuses_modified_entity_in_declared_extension_transition() {
+		let scope = extension_scope();
+		let catalog_diff = CatalogDiff {
+			added: Vec::new(),
+			removed: Vec::new(),
+			modified: vec![CatalogChange {
+				old: CatalogEntity {
+					kind: "field".to_string(),
+					scope: Some("tenant_quote".to_string()),
+					name: "body".to_string(),
+					source_path: "database/schema/900_extension/tenant.surql".to_string(),
+					statement_hash: "a".to_string(),
+					file_hash: "fa".to_string(),
+				},
+				new: CatalogEntity {
+					kind: "field".to_string(),
+					scope: Some("tenant_quote".to_string()),
+					name: "body".to_string(),
+					source_path: "database/schema/900_extension/tenant.surql".to_string(),
+					statement_hash: "b".to_string(),
+					file_hash: "fb".to_string(),
+				},
+			}],
+		};
+		let entities = scope.scope_catalog_diff_for_autoplan(catalog_diff);
+		let err = validate_autoplan(&entities).expect_err("declared extension edits still refuse");
+		let message = err.to_string();
+		assert!(message.contains("refuses modified"));
+		assert!(message.contains("field:tenant_quote.body"), "{message}");
+	}
+
+	#[test]
+	fn autoplan_refuses_removed_entity_in_declared_extension_transition() {
+		let scope = extension_scope();
+		let catalog_diff = CatalogDiff {
+			added: Vec::new(),
+			modified: Vec::new(),
+			removed: vec![CatalogEntity {
+				kind: "table".to_string(),
+				scope: None,
+				name: "tenant_quote".to_string(),
+				source_path: "database/schema/900_extension/tenant.surql".to_string(),
+				statement_hash: "old".to_string(),
+				file_hash: "old".to_string(),
+			}],
+		};
+		let entities = scope.scope_catalog_diff_for_autoplan(catalog_diff);
+		let err = validate_autoplan(&entities).expect_err("declared extension removals still refuse");
+		let message = err.to_string();
+		assert!(message.contains("refuses removed"));
+		assert!(message.contains("table:tenant_quote"), "{message}");
+	}
+
+	#[test]
+	fn autoplan_without_exclude_prefixes_still_refuses_core_edits() {
+		let catalog_diff = CatalogDiff {
+			added: vec![extension_table("tenant_quote")],
+			removed: Vec::new(),
+			modified: vec![core_field_change("old-core", "new-core")],
+		};
+		let entities = RolloutHashScope::default().scope_catalog_diff_for_autoplan(catalog_diff);
+		let err = validate_autoplan(&entities).expect_err("unscoped autoplan still refuses core edits");
+		assert!(err.to_string().contains("field:person.name"));
 	}
 
 	#[test]

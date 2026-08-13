@@ -152,6 +152,20 @@ surrealkit rollout baseline
 surrealkit rollout plan --name add_customer_indexes
 ```
 
+Automatic planning is additive-only. It does not offer a bypass around destructive
+changes. If the declared transition modifies or removes a managed entity, `rollout
+plan` refuses and names that entity; author a manual manifest under
+`database/rollouts/` and run `rollout lint` / `start` / `complete`. Do not empty
+hashes, skip lint, or special-case one tenant to make planning succeed.
+
+When `[rollouts].target_hash_exclude_prefixes` names the tenant extension
+directory, classification uses that declared transition: an additive extension
+table/seed still plans while unrelated managed-core snapshot drift is ignored.
+Source and target fingerprints stay on the managed-core complement (real hashes,
+never hand-authored). The full schema tree is still parsed, applied, and retained
+in the desired catalog. Genuine edits or removals *inside* the excluded prefix
+still refuse with the affected entity.
+
 6. Start the rollout, let application cutover happen, then complete it:
 
 ```sh
