@@ -159,12 +159,14 @@ plan` refuses and names that entity; author a manual manifest under
 hashes, skip lint, or special-case one tenant to make planning succeed.
 
 When `[rollouts].target_hash_exclude_prefixes` names the tenant extension
-directory, classification uses that declared transition: an additive extension
-table/seed still plans while unrelated managed-core snapshot drift is ignored.
-Source and target fingerprints stay on the managed-core complement (real hashes,
-never hand-authored). The full schema tree is still parsed, applied, and retained
-in the desired catalog. Genuine edits or removals *inside* the excluded prefix
-still refuse with the affected entity.
+directory, autoplan partitions that declared transition *before* stale-baseline
+reconciliation. Threshold-scale unrelated managed-core snapshot drift is caught
+up; every modified or removed entity inside the excluded prefix is preserved so
+`validate_autoplan` can refuse it by identity. An additive extension table/seed
+still plans. Source and target fingerprints stay on the managed-core complement
+(real hashes, never hand-authored). The full schema tree is still parsed,
+applied, and retained in the desired catalog. Do not empty hashes, skip lint, or
+special-case one tenant to make planning succeed.
 
 6. Start the rollout, let application cutover happen, then complete it:
 
