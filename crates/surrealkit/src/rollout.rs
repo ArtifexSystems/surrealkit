@@ -2308,6 +2308,54 @@ target_hash_exclude_prefixes = ["database/schema/900_extension/"]
 	}
 
 	#[test]
+	fn autoplan_refuses_modified_extension_with_threshold_core_drift() {
+		let scope = extension_scope();
+		let mut files = threshold_core_file_drift();
+		files.modified.push("database/schema/900_extension/tenant.surql".to_string());
+		let catalog_diff = CatalogDiff {
+			added: Vec::new(),
+			removed: Vec::new(),
+			modified: {
+				let mut modified = threshold_core_catalog_drift();
+				modified.push(extension_field_change());
+				modified
+			},
+		};
+		let (_files, entities, stale) = prepare_autoplan_diffs(&scope, files, catalog_diff);
+		assert!(stale, "unrelated core drift is threshold-scale");
+		assert_eq!(entities.modified.len(), 1);
+		assert!(entities.removed.is_empty());
+		let err = validate_autoplan(&entities)
+			.expect_err("threshold core drift plus one extension modification must refuse");
+		let message = err.to_string();
+		assert!(message.contains("refuses modified"), "{message}");
+		assert!(message.contains("field:tenant_quote.body"), "{message}");
+		assert!(!message.contains("field:person.f0"), "{message}");
+	}
+
+	#[test]
+	fn autoplan_refuses_removed_extension_with_threshold_core_drift() {
+		let scope = extension_scope();
+		let mut files = threshold_core_file_drift();
+		files.removed.push("database/schema/900_extension/tenant.surql".to_string());
+		let catalog_diff = CatalogDiff {
+			added: Vec::new(),
+			modified: threshold_core_catalog_drift(),
+			removed: vec![extension_table_removed()],
+		};
+		let (_files, entities, stale) = prepare_autoplan_diffs(&scope, files, catalog_diff);
+		assert!(stale, "unrelated core drift is threshold-scale");
+		assert!(entities.modified.is_empty());
+		assert_eq!(entities.removed.len(), 1);
+		let err = validate_autoplan(&entities)
+			.expect_err("threshold core drift plus one extension removal must refuse");
+		let message = err.to_string();
+		assert!(message.contains("refuses removed"), "{message}");
+		assert!(message.contains("table:tenant_quote"), "{message}");
+		assert!(!message.contains("field:person.f0"), "{message}");
+	}
+
+	#[test]
 	fn autoplan_refuses_modified_entity_in_declared_extension_transition() {
 		let scope = extension_scope();
 		let catalog_diff = CatalogDiff {
