@@ -15,8 +15,8 @@ use crate::rollout::{
 	load_managed_entities, release_lock, upsert_managed_entities,
 };
 use crate::schema_state::{
-	CatalogEntity, EntityKey, SchemaFile, build_catalog_snapshot, collect_schema_files,
-	ensure_local_state_dirs, ensure_overwrite, render_remove_sql,
+	CatalogEntity, EntityKey, FILESYSTEM_PROJECT_MARKER, SchemaFile, build_catalog_snapshot,
+	collect_schema_files, ensure_local_state_dirs, ensure_overwrite, render_remove_sql,
 };
 use crate::setup::run_setup;
 use crate::variables::TemplateVars;
@@ -47,10 +47,42 @@ pub struct EmbeddedSchemaFile {
 }
 
 pub async fn run_sync(db: &Surreal<Any>, opts: SyncOpts) -> Result<()> {
+	let files = collect_filesystem_schema_files()?;
+	run_sync_with_filesystem_sources(db, opts, files).await
+}
+
+/// Resolve and validate filesystem schema sources before a CLI caller connects.
+pub fn collect_filesystem_schema_files() -> Result<Vec<SchemaFile>> {
+	let files = collect_schema_files()?;
+	if files.is_empty() {
+		let root = std::env::current_dir().context("resolving filesystem sync root")?;
+		let rendered = root.display().to_string();
+		let bounded_root: String = rendered.chars().take(240).collect();
+		let suffix = if rendered.chars().count() > 240 {
+			"..."
+		} else {
+			""
+		};
+		bail!(
+			"refusing filesystem sync: resolved_root={}{} expected_marker={} source_count=0",
+			bounded_root,
+			suffix,
+			FILESYSTEM_PROJECT_MARKER
+		);
+	}
+	Ok(files)
+}
+
+/// Run a filesystem sync whose source set was validated before connection.
+pub async fn run_sync_with_filesystem_sources(
+	db: &Surreal<Any>,
+	opts: SyncOpts,
+	files: Vec<SchemaFile>,
+) -> Result<()> {
 	ensure_local_state_dirs()?;
 
 	if opts.watch {
-		run_sync_once(db, &opts, true).await?;
+		run_sync_with_files(db, &opts, &files, true).await?;
 		println!(
 			"Watch mode active ({}ms interval). Waiting for schema changes... (Ctrl+C to stop)",
 			opts.debounce_ms.max(250)
@@ -74,7 +106,7 @@ pub async fn run_sync(db: &Surreal<Any>, opts: SyncOpts) -> Result<()> {
 		}
 		Ok(())
 	} else {
-		run_sync_once(db, &opts, false).await
+		run_sync_with_files(db, &opts, &files, false).await
 	}
 }
 

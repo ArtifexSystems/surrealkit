@@ -9,6 +9,7 @@ use walkdir::WalkDir;
 use crate::core::sha256_hex;
 
 pub const SCHEMA_DIR: &str = "database/schema";
+pub const FILESYSTEM_PROJECT_MARKER: &str = "database/surrealkit.toml";
 pub const ROLLOUTS_DIR: &str = "database/rollouts";
 pub const STATE_DIR: &str = "database/snapshots";
 pub const SCHEMA_SNAPSHOT_PATH: &str = "database/snapshots/schema_snapshot.json";

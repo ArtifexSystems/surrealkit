@@ -186,8 +186,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 			allow_shared_prune,
 			max_prune,
 		} => {
+			let files = sync::collect_filesystem_schema_files()?;
 			let db = connect_from_env(env.as_ref(), &overrides).await?;
-			sync::run_sync(
+			sync::run_sync_with_filesystem_sources(
 				&db,
 				SyncOpts {
 					watch,
@@ -199,6 +200,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 					max_prune,
 					vars: template_vars,
 				},
+				files,
 			)
 			.await?;
 		}
