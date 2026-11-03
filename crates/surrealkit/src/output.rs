@@ -61,14 +61,13 @@ impl VersionReport {
 	}
 }
 
-/// `<version> for <os> on <arch>`: what `--version` prints, the release first.
+/// `surrealkit <version>`: what `--version` prints.
+///
+/// AIEUS pins exact stdout (`deploy/docker/surrealkit.tag` → `surrealkit {pin}`).
+/// Upstream beta.7 switched to `<version> for <os> on <arch>`; keep the AIEUS
+/// contract while this Artifex build carries the SurrealDB 4 SDK.
 pub fn version_line() -> String {
-	let VersionReport {
-		arch,
-		os,
-		version,
-	} = VersionReport::current();
-	format!("{version} for {os} on {arch}")
+	format!("surrealkit {VERSION}")
 }
 
 /// Print the version, as one line or, under JSON, as one document.
@@ -277,11 +276,8 @@ mod tests {
 	}
 
 	#[test]
-	fn the_version_line_leads_with_the_release() {
-		assert_eq!(
-			version_line(),
-			format!("{VERSION} for {} on {}", std::env::consts::OS, std::env::consts::ARCH)
-		);
+	fn the_version_line_is_the_aieus_cli_contract() {
+		assert_eq!(version_line(), format!("surrealkit {VERSION}"));
 	}
 
 	#[test]
