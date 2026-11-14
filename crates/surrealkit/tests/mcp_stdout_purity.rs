@@ -37,9 +37,9 @@ fn drive(dir: &TempDir, requests: &[&str], verbose: bool) -> (String, String) {
 	if verbose {
 		cmd.arg("--verbose");
 	}
-	// A host that cannot be reached is fine: the point is what the server writes,
-	// not whether the database answered.
-	cmd.env("SURREALDB_HOST", "http://127.0.0.1:9");
+	// Refuse in the real connection path without a network retry racing the
+	// stdio EOF shutdown. These cases prove output purity, not retry timing.
+	cmd.env("SURREALDB_HOST", "unsupported-transport://fixture");
 
 	let mut child = cmd
 		.stdin(Stdio::piped())
@@ -164,6 +164,8 @@ fn a_failing_tool_call_keeps_stdout_pure() {
 	);
 	let messages = assert_pure(&stdout);
 	assert_eq!(messages.len(), 2);
+	let failed = messages.iter().find(|message| message["id"] == 2).expect("tool response");
+	assert_eq!(failed["result"]["isError"], true, "{failed}");
 }
 
 #[test]
