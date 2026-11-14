@@ -32,13 +32,12 @@ fn json(bytes: &[u8]) -> serde_json::Value {
 }
 
 fn line() -> String {
-	format!("{VERSION} for {} on {}\n", std::env::consts::OS, std::env::consts::ARCH)
+	format!("surrealkit {VERSION}\n")
 }
 
-/// `-v`, `--version` and the older `-V` print one line, the release first,
-/// which is what the launcher reads an install's version from.
+/// `-v`, `--version` and the older `-V` retain AIEUS's pinned CLI contract.
 #[test]
-fn the_version_is_one_line_led_by_the_release() {
+fn the_version_is_one_line_with_the_aieus_prefix() {
 	for flag in ["--version", "-v", "-V"] {
 		let output = run(&[flag], &[]);
 		assert!(output.status.success(), "{flag}");
