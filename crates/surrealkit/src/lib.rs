@@ -19,6 +19,7 @@ pub mod selection;
 pub mod setup;
 mod surql_scan;
 pub mod sync;
+mod sync_indexes;
 // `init`'s template engine. Lives in the library (not the binary) so the MCP
 // server can scaffold projects too; `cli` and `mcp` both enable it.
 #[cfg(feature = "templates")]

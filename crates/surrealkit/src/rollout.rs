@@ -5384,9 +5384,17 @@ mod tests {
 	async fn rollback_restores_a_modified_module() {
 		let db = experimental_db().await;
 		// 3.3 reads a module's source after FROM, and refuses one without UNSIGNED.
-		let db_minor = db.version().await.expect("version").minor;
+		let version = db.version().await.expect("version");
 		let define = |comment: &str| {
-			if db_minor < 3 {
+			if version.major >= 4 {
+				// This fixture captures definitions without invoking an archive.
+				// SDK builds without Surrealism require the digest to be explicit.
+				format!(
+					"DEFINE MODULE mod::demo FROM f\"modules:/demo.surli\" \
+					DIGEST \"sha256:{}\" UNSIGNED COMMENT '{comment}';",
+					"0".repeat(64)
+				)
+			} else if version.major == 3 && version.minor < 3 {
 				format!("DEFINE MODULE mod::demo AS f\"modules:/demo.surli\" COMMENT '{comment}';")
 			} else {
 				format!(

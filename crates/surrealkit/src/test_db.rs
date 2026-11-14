@@ -13,15 +13,13 @@ pub(crate) async fn fresh(label: &str) -> Surreal<Any> {
 	fresh_with(label, Capabilities::all()).await
 }
 
-/// [`fresh`], with the experimental features `DEFINE BUCKET` and `DEFINE MODULE`
-/// need. `Capabilities::all()` leaves them off. Only the embedded engine takes
-/// this from the client: a server at `SURREALKIT_TEST_URL` has them only when it
-/// was started with `--allow-experimental=files,surrealism`.
+/// [`fresh`], with the experimental Surrealism feature `DEFINE MODULE` needs.
+/// Buckets are stable in SurrealDB 4. Only the embedded engine takes this from
+/// the client: a remote server needs `--allow-experimental=surrealism` (and
+/// `files` as well on SurrealDB 3.x).
 pub(crate) async fn fresh_experimental(label: &str) -> Surreal<Any> {
-	let caps = Capabilities::all().with_experimental_features_allowed(&[
-		ExperimentalFeature::Files,
-		ExperimentalFeature::Surrealism,
-	]);
+	let caps =
+		Capabilities::all().with_experimental_features_allowed(&[ExperimentalFeature::Surrealism]);
 	fresh_with(label, caps).await
 }
 

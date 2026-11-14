@@ -1,2 +1,6 @@
 [build]
 incremental = true
+
+[env]
+# The debug SurrealDB 4 embedded engine exceeds the test harness's 2 MiB stack.
+RUST_MIN_STACK = "16777216"

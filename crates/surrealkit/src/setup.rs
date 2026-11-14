@@ -89,9 +89,16 @@ async fn apply_setup(db: &Surreal<Any>, parts: &[&str], force: bool) -> Result<(
 		log::debug!("metadata schema is unchanged; skipping the setup DDL");
 		return Ok(());
 	}
+	let mut indexes = Vec::new();
 	for sql in parts {
-		db.query(*sql).await?.check()?;
+		indexes.extend(crate::sync_indexes::apply(db, sql).await?);
 	}
+	crate::sync_indexes::wait(
+		db,
+		&indexes,
+		std::time::Instant::now() + std::time::Duration::from_secs(60),
+	)
+	.await?;
 	// Only an optimisation: if it is not recorded, the next command runs the DDL
 	// again, which is what every command did before.
 	let rows = BTreeMap::from([(SETUP_HASH_KEY.to_string(), serde_json::json!(hash))]);
@@ -149,13 +156,17 @@ mod tests {
 	}
 
 	/// Redefine a field the setup DDL owns, so a later run shows whether it ran:
-	/// running it puts the `datetime` type back.
+	/// running it removes the marker comment. Avoid a type narrowing, which
+	/// SurrealDB 4 rightly refuses on a populated SCHEMAFULL table.
 	async fn tamper(db: &Surreal<Any>) {
-		db.query("DEFINE FIELD OVERWRITE updated_at ON __entity TYPE any;")
-			.await
-			.expect("tamper")
-			.check()
-			.expect("tamper");
+		db.query(
+			"DEFINE FIELD OVERWRITE updated_at ON __entity TYPE datetime \
+			DEFAULT time::now() COMMENT 'setup test tampered';",
+		)
+		.await
+		.expect("tamper")
+		.check()
+		.expect("tamper");
 	}
 
 	async fn ddl_ran(db: &Surreal<Any>) -> bool {
@@ -164,7 +175,8 @@ mod tests {
 			.await
 			.expect("info for table");
 		let definition: Option<String> = resp.take(0).expect("take definition");
-		definition.unwrap_or_default().contains("datetime")
+		let definition = definition.unwrap_or_default();
+		definition.contains("datetime") && !definition.contains("setup test tampered")
 	}
 
 	// On SurrealDB 3.2 every `DEFINE INDEX OVERWRITE` rebuilds the index, so the

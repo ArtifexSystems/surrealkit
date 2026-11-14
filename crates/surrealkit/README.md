@@ -170,6 +170,15 @@ Endpoints treated as embedded (no signin): `mem://`, `surrealkv://`, `rocksdb://
 
 ## Schema sync
 
+Declarative syncs define indexes on empty tables concurrently, with builds overlapping across
+changed files. Sync waits for each index to report `ready` before recording its
+file's hash, with a shared 60-second readiness budget. Failed or aborted builds
+leave the file eligible for retry. Populated tables keep synchronous index
+creation, and explicitly authored `CONCURRENTLY` definitions are left unchanged.
+Source hashes and catalog entries still describe the authored SQL.
+Syncs admitting arbitrary SQL (`allow_all_statements`) and explicit transactions
+retain their original ordered execution and synchronous index barriers.
+
 ### `embed_schema!` (compile-time embedding)
 
 `embed_schema!` walks your `.surql` files at build time and bakes them into the binary. The generated `embedded_schema::sync` applies any file whose content changed:

@@ -398,6 +398,11 @@ async fn run_sync_with_files(
 	let mut apply_errors = 0usize;
 	let mut synced_paths = BTreeSet::new();
 	let mut failed_paths = BTreeSet::new();
+	let mut applied_files = Vec::new();
+	// SQL operations can depend on earlier indexes enforcing uniqueness. Only
+	// overlap declarative files; retain ordered execution for admitted SQL.
+	let concurrent_indexes = !opts.allow_all_statements
+		&& files.iter().all(|file| crate::sync_indexes::only_defines(&file.sql).unwrap_or(false));
 	for file in files {
 		let tracked_hash = tracked.get(&file.path);
 		if tracked_hash == Some(&file.hash) {
@@ -419,12 +424,39 @@ async fn run_sync_with_files(
 				for warning in crate::rollout::relevant_warnings(db, prepared.warnings).await {
 					log::warn!("{}: {warning}", file.path);
 				}
-				exec_surql(db, &prepared.sql).await
+				if concurrent_indexes {
+					crate::sync_indexes::apply(db, &prepared.sql).await
+				} else {
+					exec_surql(db, &prepared.sql).await.map(|()| Vec::new())
+				}
 			}
 			Err(err) => Err(err.context(format!("preparing {} for apply", file.path))),
 		};
 		match applied {
-			Ok(_) => {
+			Ok(indexes) if indexes.is_empty() => {
+				if !watch_mode {
+					log::info!("applied {}", file.path);
+				}
+				store_sync_hash(db, layout.module(), &file.path, &file.hash).await?;
+				synced_paths.insert(file.path.clone());
+			}
+			Ok(indexes) => applied_files.push((file, indexes)),
+			Err(err) => {
+				apply_errors += 1;
+				failed_paths.insert(file.path.clone());
+				log::error!("error applying {}: {err:#}", file.path);
+				if opts.fail_fast {
+					return Err(err);
+				}
+			}
+		}
+	}
+	// Let empty-table builds overlap across files. A file is tracked only after
+	// every index it started reports ready; failures remain eligible for retry.
+	let deadline = std::time::Instant::now() + Duration::from_secs(60);
+	for (file, indexes) in applied_files {
+		match crate::sync_indexes::wait(db, &indexes, deadline).await {
+			Ok(()) => {
 				if !watch_mode {
 					log::info!("applied {}", file.path);
 				}

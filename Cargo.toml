@@ -3,7 +3,7 @@ members = ['crates/surrealkit', 'crates/surrealkit-macros']
 resolver = '2'
 
 [workspace.package]
-version = '1.0.0-beta.7+aieus.sd4.1'
+version = '1.0.0-beta.7+aieus.sd4.2'
 edition = '2024'
 rust-version = '1.95'
 authors = ['Chiru Boggavarapu <chiru@foretag.co>', 'Tobie Morgan Hitchcock <tobie@surrealdb.com>']

@@ -1208,7 +1208,10 @@ pub(crate) fn define_head(stmt: &crate::surql_scan::Stmt, src: &str) -> Option<D
 	})
 }
 
-fn parse_define_entity(stmt: &crate::surql_scan::Stmt, src: &str) -> Option<CatalogEntity> {
+pub(crate) fn parse_define_entity(
+	stmt: &crate::surql_scan::Stmt,
+	src: &str,
+) -> Option<CatalogEntity> {
 	let head = define_head(stmt, src)?;
 	let kind = EntityKind::from_str(stmt.tok_text(src, head.kind_index)?).ok()?;
 	let idx = head.name_index;
