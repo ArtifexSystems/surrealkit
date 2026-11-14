@@ -3150,7 +3150,7 @@ fn table_scope(entity: &EntityKey) -> Option<&str> {
 /// - an API is listed by its path, without the string quotes and without a
 ///   trailing `/`, so `"/health/"` is `/health`;
 /// - a config is listed by its type as SurrealDB spells it, so `GRAPHQL` is `GraphQL`;
-/// - a module is listed as `mod::<name>`, which is how the catalog records it.
+/// - modules use `mod::<name>` in 3.x and `ext::<name>` in 4.x.
 fn info_entry<'a>(
 	listed: &'a serde_json::Map<String, Value>,
 	kind: &EntityKind,
@@ -3171,6 +3171,9 @@ fn info_entry<'a>(
 		}
 		EntityKind::Function => get(&unquote_ident(name.strip_prefix("fn::").unwrap_or(name))),
 		EntityKind::Param => get(&unquote_ident(name.strip_prefix('$').unwrap_or(name))),
+		EntityKind::Module => {
+			name.strip_prefix("mod::").and_then(|name| get(&format!("ext::{name}")))
+		}
 		EntityKind::Field => {
 			let bare = unquote_ident(name);
 			get(&quote_ident(&bare)).or_else(|| get(&bare))
@@ -5422,7 +5425,11 @@ mod tests {
 				} else {
 					"modules"
 				},
-				"mod::demo",
+				if version.major >= 4 {
+					"ext::demo"
+				} else {
+					"mod::demo"
+				},
 			)],
 		)
 		.await;
