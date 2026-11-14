@@ -402,7 +402,11 @@ async fn run_sync_with_files(
 	// SQL operations can depend on earlier indexes enforcing uniqueness. Only
 	// overlap declarative files; retain ordered execution for admitted SQL.
 	let concurrent_indexes = !opts.allow_all_statements
-		&& files.iter().all(|file| crate::sync_indexes::only_defines(&file.sql).unwrap_or(false));
+		&& files.iter().all(|file| {
+			substitute(&file.sql, &file.path)
+				.and_then(|sql| crate::sync_indexes::only_defines(&sql))
+				.unwrap_or(false)
+		});
 	for file in files {
 		let tracked_hash = tracked.get(&file.path);
 		if tracked_hash == Some(&file.hash) {
