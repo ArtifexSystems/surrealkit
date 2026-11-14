@@ -3087,7 +3087,11 @@ pub(crate) async fn capture_definitions(
 			.and_then(|info| {
 				// SurrealDB 4 renamed INFO's module section to extensions.
 				info.get(section).or_else(|| {
-					if entity.kind == EntityKind::Module { info.get("extensions") } else { None }
+					if entity.kind == EntityKind::Module {
+						info.get("extensions")
+					} else {
+						None
+					}
 				})
 			})
 			.and_then(Value::as_object)
@@ -5412,7 +5416,14 @@ mod tests {
 			&db,
 			&format!("DEFINE BUCKET modules BACKEND \"memory\";\n{}", define("v1")),
 			&define("v2"),
-			&[in_db(if version.major >= 4 { "extensions" } else { "modules" }, "mod::demo")],
+			&[in_db(
+				if version.major >= 4 {
+					"extensions"
+				} else {
+					"modules"
+				},
+				"mod::demo",
+			)],
 		)
 		.await;
 	}
