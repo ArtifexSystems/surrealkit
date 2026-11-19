@@ -407,6 +407,10 @@ async fn run_sync_with_files(
 				.and_then(|sql| crate::sync_indexes::only_defines(&sql))
 				.unwrap_or(false)
 		});
+	// Hashes of files applied in this run, written together. A file is tracked
+	// only after it applied and every index it started reports ready.
+	let mut applied_hashes: Vec<(String, String)> = Vec::new();
+	let mut prepared_files = Vec::new();
 	for file in files {
 		let tracked_hash = tracked.get(&file.path);
 		if tracked_hash == Some(&file.hash) {
@@ -423,34 +427,82 @@ async fn run_sync_with_files(
 		}
 
 		let sql = substitute(&file.sql, &file.path)?;
-		let applied = match prepare_schema_sql(&sql) {
+		match prepare_schema_sql(&sql) {
 			Ok(prepared) => {
 				for warning in crate::rollout::relevant_warnings(db, prepared.warnings).await {
 					log::warn!("{}: {warning}", file.path);
 				}
-				if concurrent_indexes {
-					crate::sync_indexes::apply(db, &prepared.sql).await
-				} else {
-					exec_surql(db, &prepared.sql).await.map(|()| Vec::new())
-				}
+				prepared_files.push((file, prepared.sql));
 			}
-			Err(err) => Err(err.context(format!("preparing {} for apply", file.path))),
-		};
-		match applied {
-			Ok(indexes) if indexes.is_empty() => {
-				if !watch_mode {
-					log::info!("applied {}", file.path);
-				}
-				store_sync_hash(db, layout.module(), &file.path, &file.hash).await?;
-				synced_paths.insert(file.path.clone());
-			}
-			Ok(indexes) => applied_files.push((file, indexes)),
 			Err(err) => {
+				let err = err.context(format!("preparing {} for apply", file.path));
 				apply_errors += 1;
 				failed_paths.insert(file.path.clone());
 				log::error!("error applying {}: {err:#}", file.path);
 				if opts.fail_fast {
+					store_sync_hashes(db, layout.module(), &applied_hashes).await?;
 					return Err(err);
+				}
+			}
+		}
+	}
+	// Declarative files go in bounded transactions: one commit per batch rather
+	// than one per statement. A batch that fails commits nothing and is applied
+	// again file by file, so an error still names its file. Ordered SQL keeps
+	// the one-file path.
+	let batches = if concurrent_indexes {
+		crate::sync_indexes::batches(&prepared_files, BATCH_STATEMENTS)?
+	} else {
+		prepared_files.iter().map(|_| 1).collect()
+	};
+	let mut at = 0;
+	for size in batches {
+		let batch = &prepared_files[at..at + size];
+		at += size;
+		if size > 1 {
+			match crate::sync_indexes::apply_batch(db, batch).await {
+				Ok(started) => {
+					for ((file, _), indexes) in batch.iter().zip(started) {
+						if indexes.is_empty() {
+							if !watch_mode {
+								log::info!("applied {}", file.path);
+							}
+							applied_hashes.push((file.path.clone(), file.hash.clone()));
+							synced_paths.insert(file.path.clone());
+						} else {
+							applied_files.push((*file, indexes));
+						}
+					}
+					continue;
+				}
+				Err(err) => log::warn!(
+					"a batch of {size} schema files did not apply ({err:#}); applying them one by one"
+				),
+			}
+		}
+		for (file, sql) in batch {
+			let applied = if concurrent_indexes {
+				crate::sync_indexes::apply(db, sql).await
+			} else {
+				exec_surql(db, sql).await.map(|()| Vec::new())
+			};
+			match applied {
+				Ok(indexes) if indexes.is_empty() => {
+					if !watch_mode {
+						log::info!("applied {}", file.path);
+					}
+					applied_hashes.push((file.path.clone(), file.hash.clone()));
+					synced_paths.insert(file.path.clone());
+				}
+				Ok(indexes) => applied_files.push((*file, indexes)),
+				Err(err) => {
+					apply_errors += 1;
+					failed_paths.insert(file.path.clone());
+					log::error!("error applying {}: {err:#}", file.path);
+					if opts.fail_fast {
+						store_sync_hashes(db, layout.module(), &applied_hashes).await?;
+						return Err(err);
+					}
 				}
 			}
 		}
@@ -464,7 +516,7 @@ async fn run_sync_with_files(
 				if !watch_mode {
 					log::info!("applied {}", file.path);
 				}
-				store_sync_hash(db, layout.module(), &file.path, &file.hash).await?;
+				applied_hashes.push((file.path.clone(), file.hash.clone()));
 				synced_paths.insert(file.path.clone());
 			}
 			Err(err) => {
@@ -472,11 +524,13 @@ async fn run_sync_with_files(
 				failed_paths.insert(file.path.clone());
 				log::error!("error applying {}: {err:#}", file.path);
 				if opts.fail_fast {
+					store_sync_hashes(db, layout.module(), &applied_hashes).await?;
 					return Err(err);
 				}
 			}
 		}
 	}
+	store_sync_hashes(db, layout.module(), &applied_hashes).await?;
 
 	let effective_entities: Vec<CatalogEntity> = desired_catalog
 		.entities
@@ -747,7 +801,7 @@ async fn migrate_legacy_sync_keys(
 		for (legacy, target) in &re_keyed {
 			let hash = migrated.get(target).cloned().unwrap_or_default();
 			delete_sync_hashes(db, layout.module(), std::slice::from_ref(legacy)).await?;
-			store_sync_hash(db, layout.module(), target, &hash).await?;
+			store_sync_hashes(db, layout.module(), &[(target.clone(), hash)]).await?;
 		}
 	}
 	Ok(migrated)
@@ -775,16 +829,38 @@ pub(crate) async fn load_sync_hashes(
 	Ok(out)
 }
 
-async fn store_sync_hash(db: &Surreal<Any>, module: &Module, path: &str, hash: &str) -> Result<()> {
-	db.query(
-		"DELETE __entity WHERE ns = $ns AND key = $path; \
-		 CREATE __entity CONTENT { ns: $ns, key: $path, val: { hash: $hash }, updated_at: time::now() };",
-	)
-	.bind(("ns", module.partition(Partition::Sync)))
-	.bind(("path", path.to_string()))
-	.bind(("hash", hash.to_string()))
-	.await?
-	.check()?;
+/// Statements per schema-apply transaction. Bounded so one commit stays small
+/// and a failing batch's per-file retry stays short.
+const BATCH_STATEMENTS: usize = 200;
+
+/// Hash rows written per transaction.
+const HASH_ROWS: usize = 500;
+
+/// Record each applied file's hash, replacing any earlier one: one transaction
+/// per chunk instead of two commits per file.
+async fn store_sync_hashes(
+	db: &Surreal<Any>,
+	module: &Module,
+	rows: &[(String, String)],
+) -> Result<()> {
+	for chunk in rows.chunks(HASH_ROWS) {
+		let rows: Vec<serde_json::Value> = chunk
+			.iter()
+			.map(|(path, hash)| serde_json::json!({ "path": path, "hash": hash }))
+			.collect();
+		db.query(
+			"BEGIN TRANSACTION; \
+			 FOR $row IN $rows { \
+			 	DELETE __entity WHERE ns = $ns AND key = $row.path; \
+			 	CREATE __entity CONTENT { ns: $ns, key: $row.path, val: { hash: $row.hash }, updated_at: time::now() }; \
+			 }; \
+			 COMMIT TRANSACTION;",
+		)
+		.bind(("ns", module.partition(Partition::Sync)))
+		.bind(("rows", rows))
+		.await?
+		.check()?;
+	}
 	Ok(())
 }
 

@@ -65,6 +65,68 @@ pub(crate) async fn apply(db: &Surreal<Any>, sql: &str) -> Result<Vec<(String, S
 	Ok(indexes)
 }
 
+/// Group consecutive files into batches of at most `bound` statements, keeping
+/// each file whole: a file larger than the bound is a batch of its own.
+pub(crate) fn batches<F>(files: &[(F, String)], bound: usize) -> Result<Vec<usize>> {
+	let mut out = Vec::new();
+	let (mut files_in, mut statements_in) = (0usize, 0usize);
+	for (_, sql) in files {
+		let statements = scan(sql)?.len();
+		if files_in > 0 && statements_in + statements > bound {
+			out.push(files_in);
+			(files_in, statements_in) = (0, 0);
+		}
+		files_in += 1;
+		statements_in += statements;
+	}
+	if files_in > 0 {
+		out.push(files_in);
+	}
+	Ok(out)
+}
+
+/// Apply several declarative files in two transactions: their table
+/// definitions, then everything else. A table and its fields defined in one
+/// transaction make SurrealDB 4 record those fields as guaranteed, which one
+/// commit per statement never does, so the tables commit first and the stored
+/// schema is the same as file-by-file apply leaves it. Each file's empty-table
+/// indexes are started concurrently, as [`apply`] starts them; the caller waits
+/// for them before tracking a file. If the second transaction fails, the tables
+/// stay defined; every definition is applied with OVERWRITE, so the caller's
+/// file-by-file retry applies them again unchanged.
+pub(crate) async fn apply_batch<F>(
+	db: &Surreal<Any>,
+	files: &[(F, String)],
+) -> Result<Vec<Vec<(String, String)>>> {
+	let mut tables = String::new();
+	let mut rest = String::from("BEGIN TRANSACTION;\n");
+	let mut started = Vec::with_capacity(files.len());
+	for (_, file_sql) in files {
+		let mut others = String::with_capacity(file_sql.len());
+		for stmt in scan(file_sql)? {
+			let text = stmt.text(file_sql);
+			let is_table = parse_define_entity(&stmt, file_sql)
+				.is_some_and(|entity| entity.kind == EntityKind::Table);
+			let target = if is_table {
+				&mut tables
+			} else {
+				&mut others
+			};
+			target.push_str(text);
+			target.push_str(";\n");
+		}
+		let (rewritten, indexes) = prepare(&others)?;
+		rest.push_str(&rewritten);
+		started.push(indexes);
+	}
+	rest.push_str("COMMIT TRANSACTION;");
+	if !tables.is_empty() {
+		exec_surql(db, &format!("BEGIN TRANSACTION;\n{tables}COMMIT TRANSACTION;")).await?;
+	}
+	exec_surql(db, &rest).await?;
+	Ok(started)
+}
+
 pub(crate) async fn wait(
 	db: &Surreal<Any>,
 	indexes: &[(String, String)],
