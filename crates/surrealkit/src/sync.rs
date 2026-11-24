@@ -833,35 +833,24 @@ pub(crate) async fn load_sync_hashes(
 /// and a failing batch's per-file retry stays short.
 const BATCH_STATEMENTS: usize = 200;
 
-/// Hash rows written per transaction.
-const HASH_ROWS: usize = 500;
-
-/// Record each applied file's hash, replacing any earlier one: one transaction
-/// per chunk instead of two commits per file.
+/// Record each applied file's hash in place.
+///
+/// An existing path keeps its record and its `by_ns_key` entry. A new path is
+/// created. The caller writes a hash only after that file's defines and indexes
+/// have succeeded.
 async fn store_sync_hashes(
 	db: &Surreal<Any>,
 	module: &Module,
 	rows: &[(String, String)],
 ) -> Result<()> {
-	for chunk in rows.chunks(HASH_ROWS) {
-		let rows: Vec<serde_json::Value> = chunk
-			.iter()
-			.map(|(path, hash)| serde_json::json!({ "path": path, "hash": hash }))
-			.collect();
-		db.query(
-			"BEGIN TRANSACTION; \
-			 FOR $row IN $rows { \
-			 	DELETE __entity WHERE ns = $ns AND key = $row.path; \
-			 	CREATE __entity CONTENT { ns: $ns, key: $row.path, val: { hash: $row.hash }, updated_at: time::now() }; \
-			 }; \
-			 COMMIT TRANSACTION;",
-		)
-		.bind(("ns", module.partition(Partition::Sync)))
-		.bind(("rows", rows))
-		.await?
-		.check()?;
+	if rows.is_empty() {
+		return Ok(());
 	}
-	Ok(())
+	let desired = rows
+		.iter()
+		.map(|(path, hash)| (path.clone(), serde_json::json!({ "hash": hash })))
+		.collect();
+	write_partition(db, &module.partition(Partition::Sync), &desired, PartitionWrite::Merge).await
 }
 
 async fn detect_shared_db(db: &Surreal<Any>) -> Result<bool> {

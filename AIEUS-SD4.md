@@ -21,3 +21,10 @@ Proved `surrealkit sync --no-prune --fail-fast` against SurrealDB **3.3.0** and 
   guaranteed; with the split the stored schema and the `__entity` ledger equal file-by-file apply.
 - A failing batch is applied again file by file, so errors name their file and the same files are tracked.
 - Package version: `1.0.0-beta.7+aieus.sd4.3`.
+
+## sd4.4 (CURIE, 2026-11-24)
+
+- An existing `__entity` row is updated by its record id. The partition is not scanned once per changed key.
+- A file hash already stored is updated in place. A new path is created. The hash is still written only after that file's defines and indexes succeed.
+- On SurrealDB 4.0.0 RocksDB, a define-only Core schema (133 files) cold-synced in 4.21 s. Two comment-bump re-syncs took 8.08 s and 8.19 s. The same re-sync on sd4.3 took about 28 s.
+- Package version: `1.0.0-beta.7+aieus.sd4.4`.

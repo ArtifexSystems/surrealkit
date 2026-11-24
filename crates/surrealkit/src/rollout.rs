@@ -2250,7 +2250,8 @@ pub(crate) async fn write_partition(
 struct PartitionPlan {
 	/// `{ key, val }` rows for keys that are not stored yet.
 	create: Vec<Value>,
-	/// `{ key, val }` rows for stored keys whose value differs.
+	/// `{ id, val }` rows for stored keys whose value differs. `id` is the
+	/// record key, so the write addresses that row and does not scan the partition.
 	update: Vec<Value>,
 	/// Stored keys that are not desired. Empty under [`PartitionWrite::Merge`].
 	delete: Vec<String>,
@@ -2258,15 +2259,17 @@ struct PartitionPlan {
 
 impl PartitionPlan {
 	fn diff(
-		stored: &BTreeMap<String, Value>,
+		stored: &BTreeMap<String, StoredEntity>,
 		desired: &BTreeMap<&str, Value>,
 		mode: PartitionWrite,
 	) -> Self {
 		let mut plan = Self::default();
 		for (&key, val) in desired {
 			match stored.get(key) {
-				Some(current) if current == val => {}
-				Some(_) => plan.update.push(serde_json::json!({ "key": key, "val": val })),
+				Some(current) if &current.val == val => {}
+				Some(current) => {
+					plan.update.push(serde_json::json!({ "id": current.id, "val": val }))
+				}
 				None => plan.create.push(serde_json::json!({ "key": key, "val": val })),
 			}
 		}
@@ -2298,11 +2301,10 @@ impl PartitionPlan {
 		for chunk in self.update.chunks(ENTITY_WRITE_CHUNK) {
 			db.query(
 				"FOR $row IN $rows { \
-				 	UPDATE __entity SET val = $row.val, updated_at = time::now() \
-				 		WHERE ns = $ns AND key = $row.key; \
+				 	UPDATE type::record('__entity', $row.id) \
+				 		SET val = $row.val, updated_at = time::now(); \
 				 };",
 			)
-			.bind(("ns", ns.to_string()))
 			.bind(("rows", chunk.to_vec()))
 			.await?
 			.check()?;
@@ -2311,19 +2313,33 @@ impl PartitionPlan {
 	}
 }
 
-/// Every stored row of partition `ns`, as key → `val` with nulls stripped.
-async fn load_partition(db: &Surreal<Any>, ns: &str) -> Result<BTreeMap<String, Value>> {
+/// One stored `__entity` row. `id` is the record key, so an update can name the
+/// row without scanning the partition.
+struct StoredEntity {
+	id: String,
+	val: Value,
+}
+
+/// Every stored row of partition `ns`, as key → record, with nulls stripped from `val`.
+async fn load_partition(db: &Surreal<Any>, ns: &str) -> Result<BTreeMap<String, StoredEntity>> {
 	let mut resp = db
-		.query("SELECT key, val FROM __entity WHERE ns = $ns;")
+		.query("SELECT <string>record::id(id) AS id, key, val FROM __entity WHERE ns = $ns;")
 		.bind(("ns", ns.to_string()))
 		.await?;
 	let rows: Vec<Value> = resp.take(0)?;
 	Ok(rows
 		.into_iter()
 		.filter_map(|row| {
+			let id = row.get("id")?.as_str()?.to_string();
 			let key = row.get("key")?.as_str()?.to_string();
 			let val = row.get("val").map(strip_nulls).unwrap_or(Value::Null);
-			Some((key, val))
+			Some((
+				key,
+				StoredEntity {
+					id,
+					val,
+				},
+			))
 		})
 		.collect())
 }
@@ -4602,6 +4618,23 @@ mod tests {
 		entity_key_string(&entity.kind, entity.scope.as_deref(), &entity.name)
 	}
 
+	/// `key → record id` for the default module's catalog.
+	async fn entity_ids(db: &Surreal<Any>) -> BTreeMap<String, String> {
+		let mut resp = db
+			.query("SELECT key, <string>record::id(id) AS id FROM __entity WHERE ns = 'schema';")
+			.await
+			.expect("select ids");
+		let rows: Vec<Value> = resp.take(0).expect("take ids");
+		rows.iter()
+			.map(|row| {
+				(
+					string_field_req(row, "key").expect("key"),
+					string_field_req(row, "id").expect("id"),
+				)
+			})
+			.collect()
+	}
+
 	/// `key → updated_at` for the default module's catalog: whether a write
 	/// touched a row.
 	async fn entity_stamps(db: &Surreal<Any>) -> BTreeMap<String, String> {
@@ -4670,8 +4703,10 @@ mod tests {
 		assert_eq!(entity_row_count(&db).await, 300);
 
 		let before = entity_stamps(&db).await;
+		let ids_before = entity_ids(&db).await;
 		replace_managed_entities(&db, &module, &old, None, "active").await.expect("no-op");
 		assert_eq!(entity_stamps(&db).await, before, "an unchanged catalog rewrote rows");
+		assert_eq!(entity_ids(&db).await, ids_before, "an unchanged catalog replaced rows");
 
 		// 10 modified, 5 removed, 30 added.
 		let mut new = old[..295].to_vec();
@@ -4682,7 +4717,16 @@ mod tests {
 		replace_managed_entities(&db, &module, &new, None, "active").await.expect("apply diff");
 
 		let after = entity_stamps(&db).await;
+		let ids_after = entity_ids(&db).await;
 		assert_eq!(after.len(), 325);
+		for entity in &old[..295] {
+			let key = key_of(entity);
+			assert_eq!(
+				ids_after.get(&key),
+				ids_before.get(&key),
+				"{key} was replaced instead of updated"
+			);
+		}
 		for entity in &old[10..295] {
 			let key = key_of(entity);
 			assert_eq!(after.get(&key), before.get(&key), "{key} was rewritten but did not change");
